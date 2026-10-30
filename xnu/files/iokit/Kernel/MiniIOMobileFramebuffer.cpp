@@ -31,7 +31,11 @@
 extern "C" {
 #include <console/video_console.h>
 extern struct vc_info vinfo;            /* the boot framebuffer, as the text console knows it */
-int hackios_graphics_owned;             /* (the panel is CoreAnimation's from the first frame on) */
+int hackios_graphics_owned = 1;         /* (the panel belongs to the framebuffer driver from the
+                                         * first moment: the text console paints 32-bit pixels onto
+                                         * a 24bpp panel and eats random colours into the picture,
+                                         * fix62 -- its guards in video_console.c hold from boot.
+                                         * Panics are separate: debug.c calls vcputc_direct itself.) */
 }
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -40,6 +44,35 @@ int hackios_graphics_owned;             /* (the panel is CoreAnimation's from th
 #include "MiniIOSurface.h"
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
+
+extern "C" vm_offset_t ml_io_map(uint64_t phys_addr, vm_size_t size);   /* osfmk/arm/io_map.c */
+
+/*
+ * Push the framebuffer to the panel.  The GM 5 Plus hangs off a DSI command-mode interface: the
+ * panel displays the last frame it was sent, and the MDP sends a frame only when CTL_START is
+ * written -- writes to the framebuffer are invisible without that push (fix60: four bars painted,
+ * panel stayed lk2nd's blue).  Continuous pushing (PP_AUTOREFRESH) also shows content, but every
+ * push lands mid-scan and the picture rolls and scrambles (fix61, fix62) -- so the rule is one
+ * push per painted frame, from here.  Addresses are shim-shamrock/display.c's own (iomap.h:
+ * MDP at 0x01A00000, CTL_0 at +0x2000, CTL_START at +0x1C).
+ */
+static volatile uint32_t *gCtlStart;
+
+static void
+pushPanel(const char * why)
+{
+	if (gCtlStart == NULL) {
+		vm_offset_t mdp = ml_io_map(0x01A00000ULL, 0x4000);
+
+		if (mdp == 0) {
+			IOLog("MiniIOMobileFramebuffer: cannot map MDP CTL: the panel will stay dark\n");
+			return;
+		}
+		gCtlStart = (volatile uint32_t *) (mdp + 0x201C);
+		IOLog("MiniIOMobileFramebuffer: MDP CTL_START at %p\n", (void *) gCtlStart);
+	}
+	*gCtlStart = 1;
+}
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -434,6 +467,48 @@ IOMobileFramebuffer::start(IOService * provider)
 	fRowBytes = vinfo.v_rowbytes;
 	fDepth = vinfo.v_depth;
 	IOLog("MiniIOMobileFramebuffer: framebuffer %p, panel %ux%u, row %u, depth %u\n", fBase, fPanelWidth, fPanelHeight, fRowBytes, fDepth);
+
+	/*
+	 * Four colour bars, painted once at start: the visible proof the kernel owns the panel.
+	 * fix63 read the panel's byte order off the user's eyes: the bar written as [0xFF,0,0]
+	 * showed BLUE and the one written as [0,0,0xFF] showed RED, so the panel wants [B, G, R] --
+	 * exactly what store_pixel() has always written, so CoreAnimation colours need no swap.
+	 */
+	if (fBase != NULL && fDepth == 24) {
+		static const uint8_t bars[4][3] = {		/* [B, G, R], as the panel takes them */
+			{ 0x00, 0x00, 0xff },	/* bar 1: red */
+			{ 0x00, 0xff, 0x00 },	/* bar 2: green */
+			{ 0xff, 0x00, 0x00 },	/* bar 3: blue */
+			{ 0xff, 0xff, 0xff },	/* bar 4: white */
+		};
+		uint32_t barHeight = fPanelHeight / 4;
+
+		for (uint32_t y = 0; y < fPanelHeight; y++) {
+			uint8_t * row = fBase + (size_t) y * fRowBytes;
+			const uint8_t * c = bars[(y / barHeight) & 3];
+
+			for (uint32_t x = 0; x < fPanelWidth; x++) {
+				uint8_t * p = row + (size_t) x * 3;
+
+				p[0] = c[0];
+				p[1] = c[1];
+				p[2] = c[2];
+			}
+		}
+		IOLog("MiniIOMobileFramebuffer: four colour bars painted (RGB order: R G B W)\n");
+
+		/*
+		 * Take the panel away from the log mirror right now.  With the MDP autorefreshing, every
+		 * serial line paints itself over the screen for the whole boot -- fix61 showed the bars
+		 * scrolling past under a wall of kernel log text.  Panics still reach the panel: debug.c
+		 * calls vcputc_direct() itself rather than going through serial_putc_options, so only the
+		 * log echo is switched off.  drawLayer sets this again when CoreAnimation's own frames
+		 * start arriving; until then the bars stay up as the visible proof the path works.
+		 */
+		hackios_graphics_owned = 1;
+		pushPanel("colour bars");
+	}
+
 	fWidth = gFBWidth ? gFBWidth : fPanelWidth;
 	fHeight = gFBHeight ? gFBHeight : fPanelHeight;
 	if (gFBScale != 0 && gFBScale != kFBDefaultScale) {
@@ -1209,6 +1284,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		IOLog("MiniIOMobileFramebuffer: drawLayer out: src %p %ux%u stride %u, dst %p row %u depth %u\n",
 		    (const uint8_t *) surfaces[0]->pixels(), (unsigned) surfaces[0]->info.width,
 		    (unsigned) surfaces[0]->info.height, surfaces[0]->info.bytesPerRow, fBase, fRowBytes, fDepth);
+	}
+	if (surfaces[0] != NULL && fGraphics) {
+		pushPanel("swap");
 	}
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {

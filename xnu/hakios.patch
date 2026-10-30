@@ -4849,7 +4849,7 @@ index c622b4cc84ab..370e2af40204 100644
  
  void
 diff --git a/pexpert/arm/pe_kprintf.c b/pexpert/arm/pe_kprintf.c
-index 65144c74239c..70c4ff8bd979 100644
+index 65144c74239c..987927155a21 100644
 --- a/pexpert/arm/pe_kprintf.c
 +++ b/pexpert/arm/pe_kprintf.c
 @@ -29,6 +29,7 @@ SECURITY_READ_ONLY_LATE(bool) enable_dklog_serial_output = false;
@@ -4879,7 +4879,7 @@ index 65144c74239c..70c4ff8bd979 100644
  }
  STARTUP(KPRINTF, STARTUP_RANK_FIRST, PE_init_kprintf);
  
-@@ -159,13 +152,27 @@ serial_putc_crlf(char c)
+@@ -159,13 +152,21 @@ serial_putc_crlf(char c)
  	if (c == '\n') {
  		uart_putc('\r');
  	}
@@ -4890,20 +4890,14 @@ index 65144c74239c..70c4ff8bd979 100644
  void
  serial_putc_options(char c, bool poll)
  {
-+	extern void vcputc_direct(char c);
-+	extern int hackios_graphics_owned;     /* iokit/Kernel/MiniIOMobileFramebuffer.cpp: set once the first frame is drawn */
 +	loader_log_putc(c);
  	uart_putc_options(c, poll);
-+	/* (HAKIOS) the panel is CoreAnimation's from the first frame on: mirroring the log
-+	 * to it here was wiping every frame the driver drew (one IOLog line painted one
-+	 * console line over the picture).  Panics still reach the panel: debug.c calls
++	/* (HAKIOS) no mirror to the video console here.  It used to paint every log character on
++	 * the panel until the first frame arrived; with the panel finally live (fix61) that showed
++	 * what it really does: the text console lays 32-bit pixels on a 24bpp framebuffer, so its
++	 * text and scrolling ate random colours into the picture (fix62).  The panel gets pixels
++	 * from MiniIOMobileFramebuffer only.  Panics still reach it: debug.c calls
 +	 * vcputc_direct() itself, without going through here. */
-+	if (!hackios_graphics_owned) {
-+		if (c == '\n') {
-+			vcputc_direct('\r');
-+		}
-+		vcputc_direct(c);
-+	}
  }
  
  void

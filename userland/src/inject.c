@@ -2135,7 +2135,10 @@ struct hakios_data_region {
 	uint64_t  words;                 /* 8-byte words of it */
 };
 
-/* The writable segments of QuartzCore, and where the image starts. */
+/* The writable segments of QuartzCore, and where the image starts.  For an image in the dyld
+ * shared cache the slide that _dyld_get_image_vmaddr_slide() reports cannot always be trusted,
+ * so the segment's runtime address is worked out from the header's own place in memory instead:
+ * the header is __TEXT's start, and every segment is at its vmaddr's distance from __TEXT's. */
 static int
 hakios_quartzcore_data(uintptr_t *base_out, struct hakios_data_region *regions, int max_regions)
 {
@@ -2143,14 +2146,27 @@ hakios_quartzcore_data(uintptr_t *base_out, struct hakios_data_region *regions, 
 		const char *path = _dyld_get_image_name(image);
 		const struct mach_header_64 *header;
 		const uint8_t *command;
-		intptr_t slide;
+		uint64_t text_vmaddr = 0;
 		int found = 0;
 
 		if (path == NULL || strstr(path, "/QuartzCore") == NULL) {
 			continue;
 		}
 		header = (const struct mach_header_64 *) _dyld_get_image_header(image);
-		slide = _dyld_get_image_vmaddr_slide(image);
+		command = (const uint8_t *) (header + 1);
+		/* first pass: __TEXT's vmaddr, to measure every other segment's distance from it */
+		for (uint32_t n = 0; n < header->ncmds; n++) {
+			const struct segment_command_64 *seg = (const struct segment_command_64 *) command;
+
+			if (seg->cmd == LC_SEGMENT_64 && strcmp(seg->segname, "__TEXT") == 0) {
+				text_vmaddr = seg->vmaddr;
+				break;
+			}
+			command += seg->cmdsize;
+		}
+		if (text_vmaddr == 0) {
+			continue;
+		}
 		if (base_out != NULL) {
 			*base_out = (uintptr_t) header;
 		}
@@ -2160,8 +2176,10 @@ hakios_quartzcore_data(uintptr_t *base_out, struct hakios_data_region *regions, 
 
 			if (seg->cmd == LC_SEGMENT_64 && seg->vmsize >= 8 && seg->vmsize <= 0x4000000
 			    && (strcmp(seg->segname, "__DATA") == 0 || strcmp(seg->segname, "__DATA_DIRTY") == 0)) {
+				uintptr_t at = (uintptr_t) header + (uintptr_t) (seg->vmaddr - text_vmaddr);
+
 				if (regions != NULL && found < max_regions) {
-					regions[found].start = (uintptr_t) seg->vmaddr + (uintptr_t) slide;
+					regions[found].start = at;
 					regions[found].words = seg->vmsize / 8;
 				}
 				found++;
