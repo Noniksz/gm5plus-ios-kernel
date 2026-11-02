@@ -144,7 +144,7 @@ watch_main_loop(void)
  * return addresses, and every two seconds a block says when the main queue serviced it.  Nothing is
  * suspended: thread_get_state on a running thread is what inject_fairplay.c's sampler uses.
  */
-#define WATCH_SAMPLES 6000                  /* 1 Hz: the process started at 168 s in fix104 */
+#define WATCH_SAMPLES 300                  /* 1 Hz: the process started at 168 s in fix104 */
 static mach_port_t sb_main_thread;
 static uintptr_t slide;                    /* the shared cache's, for unslid addresses in the log */
 static volatile unsigned mainq_beats;      /* main-queue blocks that have run */
@@ -542,33 +542,24 @@ dump_threads(unsigned owner_word)
 	vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_t));
 }
 
-extern kern_return_t mach_msg_send(mach_msg_header_t *msg);
-
 static void
 sb_wake_reply(uint32_t id, mach_port_t rname)
 {
-	struct {
-		mach_msg_header_t h;
-		uint32_t ndr;
-		int32_t retcode;
-	} r;
+	mach_msg_header_t h;
 
 	if (rname == MACH_PORT_NULL || rname == MACH_PORT_DEAD) {
 		return;
 	}
-	memset(&r, 0, sizeof r);
-	r.h.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND, 0);
-	r.h.msgh_size = sizeof r; /* 32: header + NDR + RetCode */
-	r.h.msgh_remote_port = rname;
-	r.h.msgh_local_port = MACH_PORT_NULL;
-	r.h.msgh_voucher_port = MACH_PORT_NULL;
-	r.h.msgh_id = (mach_msg_id_t)id;
-	r.ndr = 0;
-	r.retcode = (int32_t)0x10000003; /* MIG_BAD_ARGUMENTS: clean error, no out-param parse */
-	mach_port_insert_right(mach_task_self(), rname, rname, MACH_MSG_TYPE_MAKE_SEND);
-	say("hakios: sb wake: sending err-reply id %#x -> rname %#x\n", id, rname);
-	kern_return_t kr = mach_msg_send(&r.h);
-	say("hakios: sb wake: sent id %#x rname %#x kr=%d\n", id, rname, kr);
+	memset(&h, 0, sizeof h);
+	h.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND, 0);
+	h.msgh_size = sizeof h;
+	h.msgh_remote_port = rname;
+	h.msgh_local_port = MACH_PORT_NULL;
+	h.msgh_voucher_port = MACH_PORT_NULL;
+	h.msgh_id = (mach_msg_id_t)id;
+	kern_return_t kr = mach_msg(&h, MACH_SEND_MSG, sizeof h, 0, MACH_PORT_NULL,
+	    MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+	say("hakios: sb wake: fake reply id %#x -> rname %#x kr=%d\n", id, rname, kr);
 }
 
 static void *
@@ -583,7 +574,7 @@ sb_main_watchdog(__unused void *ignored)
 		mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
 		uintptr_t pc, lr, sp, fp;
 
-		usleep(100 * 1000);
+		usleep(1000 * 1000);
 		if (thread_get_state(sb_main_thread, ARM_THREAD_STATE64, (thread_state_t)&state, &count) != KERN_SUCCESS) {
 			say("hakios: sb main thread: thread_get_state failed at sample %u\n", i);
 			break;
@@ -599,23 +590,6 @@ sb_main_watchdog(__unused void *ignored)
 		    (unsigned long long)state.x[2], (unsigned long long)state.x[3],
 		    (unsigned long long)state.x[4], (unsigned long long)state.x[5],
 		    (unsigned long long)state.x[6], (unsigned long long)state.x[7], mainq_beats);
-		{
-			uint64_t opt = state.x[1];
-			bool snd = (opt & 1) != 0, rcv = (opt & 2) != 0;
-			if (snd && rcv) {
-				say("hakios: wdbg i=%u bid=%#x rn=%#x\n", i,
-				    (unsigned)(state.x[4] >> 32), (unsigned)(state.x[5] >> 32));
-				uint32_t bid = (uint32_t)(state.x[4] >> 32);
-				mach_port_t rname = (mach_port_t)(state.x[5] >> 32);
-				{
-					static unsigned woke;
-					if (woke < 400 && rname != MACH_PORT_NULL && rname != MACH_PORT_DEAD) {
-						woke++;
-						sb_wake_reply(bid, rname);
-					}
-				}
-			}
-		}
 		if (i == 0) {
 			say_console("hakios: sb watchdog console write works\n");
 		}
@@ -632,6 +606,18 @@ sb_main_watchdog(__unused void *ignored)
 			bool send = (opt & 1) != 0;
 			bool recv = (opt & 2) != 0;
 
+			if (send && recv) {
+				uint32_t bid = (uint32_t)(state.x[4] >> 32);
+				mach_port_t rname = (mach_port_t)(state.x[5] >> 32);
+				if (bid == 0x5b8db2 || bid == 0x5b9171) {
+					static unsigned woke[2];
+					unsigned slot = (bid == 0x5b8db2) ? 0 : 1;
+					if (woke[slot] < 40 && (i % 3) == 0) {
+						woke[slot]++;
+						sb_wake_reply(bid, rname);
+					}
+				}
+			}
 
 			if (send && dumps < 2 && (i % 5) == 0) {
 				dumps++;
