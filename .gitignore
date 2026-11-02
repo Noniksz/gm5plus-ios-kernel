@@ -86,3 +86,4 @@ tools/
 repos/
 scripts/
 opencode.json
+venv/

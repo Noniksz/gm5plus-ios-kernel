@@ -28,12 +28,16 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <IOKit/IOKitLib.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/mach_port.h>
+#include <mach/arm/thread_status.h>
+#include <mach_debug/mach_debug_types.h>
 #include <notify.h>
 #include <objc/runtime.h>
 #include <objc/message.h>
@@ -59,11 +63,12 @@ extern const void *_dyld_get_shared_cache_range(size_t *length);
 #define HAKIOS_GL "/redwood/lib/libhakios.gl.dylib"
 
 static uintptr_t slide;
+static int hakios_ca_prod;               /* fix77: boot-arg ca_prod=1 re-arms fix76's prod */
 
 static void
 say(const char *format, ...)
 {
-	char line[256];
+	char line[640];
 	va_list ap;
 	int n;
 
@@ -132,12 +137,18 @@ my_is_ready(void *display)
 	int ready = orig_is_ready(display);
 
 	if (ready != last_ready || calls_ready < 3) {
-		say("hakios: is_ready -> %d (call %u, flags %#llx, b233 %#x)\n", ready, calls_ready,
-		    (unsigned long long)DISPLAY_FLAGS(display), DISPLAY_B233(display));
+		say("hakios: is_ready: orig=%d -> FORCED 1 (call %u, flags %#llx, b233 %#x)\n", ready,
+		    calls_ready, (unsigned long long)DISPLAY_FLAGS(display), DISPLAY_B233(display));
 		last_ready = ready;
 	}
 	calls_ready++;
-	return ready;
+	/*
+	 * fix65: forced.  is_ready() reads the display's power state, and our display never
+	 * completes a power change (no real hardware behind it), so orig stays 0 forever -- and
+	 * CA::WindowServer then drops every update as "not ready".  The CPU compositor paints
+	 * whatever arrives anyway, so ready is always true here.
+	 */
+	return 1;
 }
 
 static int
@@ -511,6 +522,264 @@ my_function_uniform(void *context, unsigned index, size_t components, size_t cou
 	orig_function_uniform(context, index, components, count, values);
 }
 
+/*
+ * fix78: the ObjC display's own update path, watched.  fix77's enumeration named the methods;
+ * this round asks what they answer -- whether the server ever calls update (our kick does),
+ * what canUpdate/canUpdateWithFlags/needsUpdate say, and whether the update request callback
+ * (the object EAGLServer::update dispatches through, [display+0x28]) is ever set.  Every hook
+ * calls the original; this round changes no answer.
+ */
+static int safe_copy(uintptr_t from, void *into, size_t length);   /* defined below: read without taking a fault */
+
+static uintptr_t
+ca_unslide(uintptr_t p)
+{
+	/* the shared cache lives above CACHE_BASE; heap objects below it */
+	return (p > CACHE_BASE) ? p - slide : p;
+}
+
+/*
+ * fix82: what the ObjC update path is really looking at.  The static read said
+ * [display+8] -> EAGLServer at +0x40 -> AppleCLCDDisplay at +0x60, and that EAGLServer::update
+ * reads the callback at C+0x28 while the ObjC setter stores it at C+0x680.  One of the two
+ * offsets is wrong; print the whole chain and both callback slots, before and after the
+ * original runs.  Reads go through vm_read_overwrite, so a stale pointer prints as NULL, not
+ * as a fault.
+ */
+static void
+ca_dump_chain(id self, const char *when)
+{
+	uintptr_t impl = 0, server = 0, disp = 0, vt = 0, iomfb = 0;
+	uint64_t cb28 = 0, cb680 = 0, flags = 0, w250 = 0;
+
+	if (!safe_copy((uintptr_t) self + 8, &impl, sizeof(impl)) || impl == 0) {
+		say("hakios: CA chain %s: self=%p no _impl\n", when, (void *) self);
+		return;
+	}
+	safe_copy(impl + 0x40, &server, sizeof(server));
+	if (server == 0) {
+		say("hakios: CA chain %s: self=%p impl=%p srv=NULL\n", when, (void *) self, (void *) impl);
+		return;
+	}
+	safe_copy(server + 0x60, &disp, sizeof(disp));
+	if (disp == 0) {
+		say("hakios: CA chain %s: self=%p impl=%p srv=%p disp=NULL\n",
+		    when, (void *) self, (void *) impl, (void *) server);
+		return;
+	}
+	safe_copy(disp, &vt, sizeof(vt));
+	safe_copy(disp + 0x28, &cb28, sizeof(cb28));
+	safe_copy(disp + 0x680, &cb680, sizeof(cb680));
+	safe_copy(disp + 0x9f2, &flags, sizeof(flags));
+	safe_copy(disp + 0x250, &w250, sizeof(w250));
+	safe_copy(disp + 0x318, &iomfb, sizeof(iomfb));
+	say("hakios: CA chain %s: self=%p impl=%p srv=%p disp=%p vt=%#lx\n",
+	    when, (void *) self, (void *) impl, (void *) server, (void *) disp, (unsigned long) ca_unslide(vt));
+	say("hakios: CA cb %s: c28=%#lx c680=%#lx flags=%#llx w250=%#llx iomfb=%p\n",
+	    when, (unsigned long) ca_unslide(cb28), (unsigned long) ca_unslide(cb680),
+	    (unsigned long long) flags, (unsigned long long) w250, (void *) iomfb);
+}
+
+static void (*orig_ca_update)(id, SEL);
+static BOOL (*orig_ca_canUpdate)(id, SEL);
+static BOOL (*orig_ca_canUpdateWithFlags)(id, SEL, unsigned);
+static BOOL (*orig_ca_needsUpdate)(id, SEL);
+static void (*orig_ca_setUpdateRequestCallback)(id, SEL, id);
+static id (*orig_ca_updateRequestCallback)(id, SEL);
+static void (*orig_ca_powerStateDidChange)(id, SEL);
+static BOOL (*orig_ca_disablesUpdates)(id, SEL);
+static void (*orig_ca_setDisablesUpdates)(id, SEL, BOOL);
+
+/* fix129: backboardd başlangıçta "disabling framebuffer changes on display (1)" setzt ve asla
+ * temizlemiyor, bu yüzden CoreAnimation bir kere çizer ve asla yenilemez -- panel sabit mavi kalır.
+ * setDisablesUpdates: çağrısındaki değeri her zaman NO yapar; getter her çağrıldığında durumu loglar. */
+static BOOL
+hooked_ca_disablesUpdates(id self, SEL _cmd)
+{
+	BOOL r = orig_ca_disablesUpdates ? orig_ca_disablesUpdates(self, _cmd) : NO;
+	static unsigned n;
+
+	if (n++ < 16) {
+		say("hakios: -[CAWindowServerDisplay disablesUpdates] -> %d (call %u)\n", (int) r, n);
+	}
+	return r;
+}
+
+static void
+hooked_ca_setDisablesUpdates(id self, SEL _cmd, BOOL value)
+{
+	static unsigned n;
+
+	if (n++ < 16) {
+		say("hakios: -[CAWindowServerDisplay setDisablesUpdates:%d] -> forced NO (call %u)\n",
+		    (int) value, n);
+	}
+	if (orig_ca_setDisablesUpdates) {
+		orig_ca_setDisablesUpdates(self, _cmd, NO);
+	}
+}
+
+static void
+hooked_ca_update(id self, SEL _cmd)
+{
+	static unsigned n;
+
+	if (n++ < 8) {
+		say("hakios: -[CAWindowServerDisplay update] call %u\n", n);
+		ca_dump_chain(self, "pre");
+	}
+	if (orig_ca_update) {
+		orig_ca_update(self, _cmd);
+	}
+	if (n <= 8) {
+		ca_dump_chain(self, "post");
+	}
+}
+
+static BOOL
+hooked_ca_canUpdate(id self, SEL _cmd)
+{
+	BOOL r = orig_ca_canUpdate ? orig_ca_canUpdate(self, _cmd) : NO;
+	static unsigned n;
+
+	if (n++ < 8) {
+		say("hakios: -[CAWindowServerDisplay canUpdate:] -> %d\n", (int) r);
+	}
+	return r;
+}
+
+static BOOL
+hooked_ca_canUpdateWithFlags(id self, SEL _cmd, unsigned flags)
+{
+	BOOL r = orig_ca_canUpdateWithFlags ? orig_ca_canUpdateWithFlags(self, _cmd, flags) : NO;
+	static unsigned n;
+
+	if (n++ < 8) {
+		say("hakios: -[CAWindowServerDisplay canUpdateWithFlags:%#x] -> %d\n", flags, (int) r);
+	}
+	return r;
+}
+
+static BOOL
+hooked_ca_needsUpdate(id self, SEL _cmd)
+{
+	BOOL r = orig_ca_needsUpdate ? orig_ca_needsUpdate(self, _cmd) : NO;
+	static unsigned n;
+
+	if (n++ < 8) {
+		say("hakios: -[CAWindowServerDisplay needsUpdate] -> %d\n", (int) r);
+	}
+	return r;
+}
+
+static void
+hooked_ca_setUpdateRequestCallback(id self, SEL _cmd, id callback)
+{
+	static unsigned n;
+
+	if (n++ < 8) {
+		say("hakios: -[CAWindowServerDisplay setUpdateRequestCallback:%p] call %u\n", (void *) callback, n);
+	}
+	if (orig_ca_setUpdateRequestCallback) {
+		orig_ca_setUpdateRequestCallback(self, _cmd, callback);
+	}
+}
+
+static id
+hooked_ca_updateRequestCallback(id self, SEL _cmd)
+{
+	id r = orig_ca_updateRequestCallback ? orig_ca_updateRequestCallback(self, _cmd) : nil;
+	static unsigned n;
+
+	if (n++ < 8) {
+		say("hakios: -[CAWindowServerDisplay updateRequestCallback] -> %p\n", (void *) r);
+	}
+	return r;
+}
+
+static void
+hooked_ca_powerStateDidChange(id self, SEL _cmd)
+{
+	static unsigned n;
+
+	if (n++ < 8) {
+		say("hakios: -[CAWindowServerDisplay powerStateDidChange:] call %u\n", n);
+	}
+	if (orig_ca_powerStateDidChange) {
+		orig_ca_powerStateDidChange(self, _cmd);
+	}
+}
+
+static void
+ca_display_probe_fixes(void)
+{
+	Class cls = objc_getClass("CAWindowServerDisplay");
+	Method m;
+
+	if (cls == NULL) {
+		say("hakios: CAWindowServerDisplay not found for the probe\n");
+		return;
+	}
+	m = class_getInstanceMethod(cls, sel_registerName("update"));
+	if (m != NULL) {
+		orig_ca_update = (void (*)(id, SEL)) method_setImplementation(m, (IMP) hooked_ca_update);
+	}
+	m = class_getInstanceMethod(cls, sel_registerName("canUpdate:"));
+	if (m != NULL) {
+		orig_ca_canUpdate = (BOOL (*)(id, SEL)) method_setImplementation(m, (IMP) hooked_ca_canUpdate);
+	}
+	m = class_getInstanceMethod(cls, sel_registerName("canUpdateWithFlags:"));
+	if (m != NULL) {
+		orig_ca_canUpdateWithFlags = (BOOL (*)(id, SEL, unsigned)) method_setImplementation(m,
+		    (IMP) hooked_ca_canUpdateWithFlags);
+	}
+	m = class_getInstanceMethod(cls, sel_registerName("needsUpdate"));
+	if (m != NULL) {
+		orig_ca_needsUpdate = (BOOL (*)(id, SEL)) method_setImplementation(m, (IMP) hooked_ca_needsUpdate);
+	}
+	m = class_getInstanceMethod(cls, sel_registerName("setUpdateRequestCallback:"));
+	if (m != NULL) {
+		orig_ca_setUpdateRequestCallback = (void (*)(id, SEL, id)) method_setImplementation(m,
+		    (IMP) hooked_ca_setUpdateRequestCallback);
+	}
+	m = class_getInstanceMethod(cls, sel_registerName("updateRequestCallback"));
+	if (m != NULL) {
+		orig_ca_updateRequestCallback = (id (*)(id, SEL)) method_setImplementation(m,
+		    (IMP) hooked_ca_updateRequestCallback);
+	}
+	m = class_getInstanceMethod(cls, sel_registerName("powerStateDidChange:"));
+	if (m != NULL) {
+		orig_ca_powerStateDidChange = (void (*)(id, SEL)) method_setImplementation(m,
+		    (IMP) hooked_ca_powerStateDidChange);
+	}
+	m = class_getInstanceMethod(cls, sel_registerName("disablesUpdates"));
+	if (m != NULL) {
+		orig_ca_disablesUpdates = (BOOL (*)(id, SEL)) method_setImplementation(m,
+		    (IMP) hooked_ca_disablesUpdates);
+	}
+	m = class_getInstanceMethod(cls, sel_registerName("setDisablesUpdates:"));
+	if (m != NULL) {
+		orig_ca_setDisablesUpdates = (void (*)(id, SEL, BOOL)) method_setImplementation(m,
+		    (IMP) hooked_ca_setDisablesUpdates);
+	}
+	say("hakios: CAWindowServerDisplay probe: update=%d canUpdate=%d needsUpdate=%d callback=%d power=%d disablesUpdates=%d setDisablesUpdates=%d\n",
+	    orig_ca_update != NULL, orig_ca_canUpdate != NULL, orig_ca_needsUpdate != NULL,
+	    orig_ca_setUpdateRequestCallback != NULL, orig_ca_powerStateDidChange != NULL,
+	    orig_ca_disablesUpdates != NULL, orig_ca_setDisablesUpdates != NULL);
+	/*
+	 * fix82: the ObjC method bodies, unslid, so the host can disassemble exactly what update
+	 * calls and settle the C+0x28 / C+0x680 question from the real code, not from inference.
+	 */
+	say("hakios: CA IMPs: update=%#lx canUpd=%#lx canUpdF=%#lx needs=%#lx setCb=%#lx getCb=%#lx power=%#lx\n",
+	    (unsigned long) ca_unslide((uintptr_t) orig_ca_update),
+	    (unsigned long) ca_unslide((uintptr_t) orig_ca_canUpdate),
+	    (unsigned long) ca_unslide((uintptr_t) orig_ca_canUpdateWithFlags),
+	    (unsigned long) ca_unslide((uintptr_t) orig_ca_needsUpdate),
+	    (unsigned long) ca_unslide((uintptr_t) orig_ca_setUpdateRequestCallback),
+	    (unsigned long) ca_unslide((uintptr_t) orig_ca_updateRequestCallback),
+	    (unsigned long) ca_unslide((uintptr_t) orig_ca_powerStateDidChange));
+}
+
 static void
 window_server_fixes(void)
 {
@@ -549,6 +818,47 @@ window_server_fixes(void)
 	}
 	say("hakios: window server hooks %s\n", orig_is_ready && orig_ignore_update_p && orig_begin_update &&
 	    orig_finish_update && orig_renderer && orig_render_update ? "installed" : "INCOMPLETE");
+
+	/*
+	 * fix77: the map we are missing.  Nine rounds say the ObjC display object is open (blanked=0,
+	 * disablesUpdates=0, curMode good) and the C++ display is now ready (is_ready=1 when asked);
+	 * what never happens is the server's OWN update loop: its vtable slots see zero calls.  So
+	 * the gate lives in the ObjC server layer -- the question is which method of it stands
+	 * closed.  Instead of guessing names, enumerate the server's and the display's methods whose
+	 * selectors speak of updating, powering, waking, timers and vsync, with their unslid IMPs:
+	 * that is the map the next round hooks, and for "ipsw dyld a2s" the addresses are a sentence.
+	 */
+	{
+		static const char *const classes[] = { "CAWindowServer", "CAWindowServerDisplay" };
+		static const char *const needles[] = { "update", "Update", "wake", "Wake", "power", "Power",
+		    "timer", "Timer", "vsync", "VSync", "displayDid", "awake" };
+
+		for (unsigned c = 0; c < 2; c++) {
+			Class cls = objc_getClass(classes[c]);
+			unsigned nmethods = 0;
+			Method *methods = cls != NULL ? class_copyMethodList(cls, &nmethods) : NULL;
+			unsigned shown = 0;
+
+			for (unsigned m = 0; methods != NULL && m < nmethods && shown < 40; m++) {
+				const char *name = sel_getName(method_getName(methods[m]));
+				bool interesting = false;
+
+				for (unsigned k = 0; k < sizeof(needles) / sizeof(needles[0]) && !interesting; k++) {
+					interesting = strstr(name, needles[k]) != NULL;
+				}
+				if (interesting) {
+					shown++;
+					say("hakios:   %c%s %u: %s imp=%#lx\n", c == 0 ? '+' : '+', classes[c], m, name,
+					    (unsigned long)((uintptr_t)method_getImplementation(methods[m]) - slide));
+				}
+			}
+			free(methods);
+			say("hakios: %s: %u methods, %u of interest\n", classes[c], nmethods, shown);
+		}
+	}
+
+	/* fix78: ask the display's own update path what it answers; see ca_display_probe_fixes(). */
+	ca_display_probe_fixes();
 }
 
 /* ---- backboardd: no ambient light sensor ------------------------------------------------------------ */
@@ -2071,10 +2381,521 @@ static void hakios_install_brightness_and_display_fixes(void) {
 
 static id (*orig_serverWithOptions)(id self, SEL _cmd, id options) = NULL;
 
+/*
+ * fix65: the gates that keep the first frame from ever being committed.  fix49 -- the last boot
+ * where backboardd lived -- shows the sequence in full: StartWindowServer asks for the server with
+ * kCAWindowServerDisableUpdatesOnMainDisplay set, the display comes up blanked and disabled, and
+ * although backboardd clears the disable option four seconds itself ([RenderOverlay] Enabling
+ * framebuffer changes), the display is never unblanked: kFBMethodRequestPowerChange (selector 12)
+ * and registerNotificationPort (selector 72) are never called, so CA::WindowServer's IOMFBDisplay
+ * stays _blanked and no frame pump ever starts.  Nothing on this board will ever send the power
+ * response that unblanks it, so we do it here: hand the server nil options (the freeze option
+ * never gets set), hook the display's three gate setters to refuse YES, and kick the display
+ * itself until the render loop wakes up.
+ */
+static void (*orig_real_setBlanked)(id self, SEL _cmd, BOOL b) = NULL;
+static void (*orig_real_setDisablesUpdates)(id self, SEL _cmd, BOOL d) = NULL;
+static void (*orig_real_setDisabled)(id self, SEL _cmd, BOOL d) = NULL;
+
+static void
+hooked_real_setBlanked(id self, SEL _cmd, BOOL b)
+{
+	say("hakios: -[CAWindowServerDisplay setBlanked:%d] -> FORCING NO\n", (int) b);
+	if (orig_real_setBlanked) {
+		orig_real_setBlanked(self, _cmd, NO);
+	}
+}
+
+static void
+hooked_real_setDisablesUpdates(id self, SEL _cmd, BOOL d)
+{
+	say("hakios: -[CAWindowServerDisplay setDisablesUpdates:%d] -> FORCING NO\n", (int) d);
+	if (orig_real_setDisablesUpdates) {
+		orig_real_setDisablesUpdates(self, _cmd, NO);
+	}
+}
+
+static void
+hooked_real_setDisabled(id self, SEL _cmd, BOOL d)
+{
+	say("hakios: -[CAWindowServerDisplay setDisabled:%d] -> FORCING NO\n", (int) d);
+	if (orig_real_setDisabled) {
+		orig_real_setDisabled(self, _cmd, NO);
+	}
+}
+
+/*
+ * dispmode: the mode question from the object side.  The IOMFB trace shows selectors 4/5/12/72
+ * never called and every kick reads curMode=<CADisplayMode 1125x2436 internal_panel> yet
+ * begin=0 finish=0 render=0: the frame pump never starts.  One suspect is the mode handshake --
+ * setDisplayMode: answering an error (or currentDisplayMode answering -1) keeps CoreAnimation
+ * from ever arming the swap loop.  So: accept every mode request as success, and never answer
+ * -1 for the current mode.  The selectors exist in the DSC (grep-verified): setDisplayMode:,
+ * currentDisplayMode, setCurrentMode:, setDisablesUpdates:, disablesUpdates.
+ */
+/* NSInteger is not visible through this SDK's plain C headers here; long matches it on arm64. */
+typedef long hakios_NSInteger;
+
+static void *orig_setDisplayMode;
+static void *orig_currentDisplayMode_id;
+static void *orig_currentDisplayMode_int;
+static void *orig_setCurrentMode;
+static unsigned calls_setmode;
+static unsigned calls_curmode;
+static unsigned calls_setcurmode;
+
+static void
+hooked_setDisplayMode(id self, SEL _cmd, id arg)
+{
+	calls_setmode++;
+	say("hakios: DISPMODE -[%s setDisplayMode:] -> 0 (call #%u, arg=%s)\n",
+	    class_getName(object_getClass(self)), calls_setmode,
+	    arg != nil ? "non-nil" : "nil");
+	/* The real argument count is not known from the DSC strings; touching the arguments we
+	 * did not read would risk a crash, so log and answer kIOReturnSuccess without forwarding. */
+	return;
+}
+
+static id
+hooked_currentDisplayMode_id(id self, SEL _cmd)
+{
+	calls_curmode++;
+	id (*real)(id, SEL) = (id (*)(id, SEL)) orig_currentDisplayMode_id;
+	id r = real != NULL ? real(self, _cmd) : nil;
+
+	say("hakios: DISPMODE -[%s currentDisplayMode] -> %s (id, call #%u)\n",
+	    class_getName(object_getClass(self)), r != nil ? "kept" : "forced 0", calls_curmode);
+	return r != nil ? r : (id) 0;
+}
+
+static hakios_NSInteger
+hooked_currentDisplayMode_int(id self, SEL _cmd)
+{
+	calls_curmode++;
+	hakios_NSInteger (*real)(id, SEL) = (hakios_NSInteger (*)(id, SEL)) orig_currentDisplayMode_int;
+	hakios_NSInteger r = real != NULL ? real(self, _cmd) : -1;
+
+	say("hakios: DISPMODE -[%s currentDisplayMode] -> %ld (NSInteger, call #%u)\n",
+	    class_getName(object_getClass(self)), (long) (r != -1 ? r : 0), calls_curmode);
+	return r != -1 ? r : 0;
+}
+
+static void
+hooked_setCurrentMode(id self, SEL _cmd, hakios_NSInteger mode)
+{
+	calls_setcurmode++;
+	say("hakios: DISPMODE -[%s setCurrentMode:%ld] -> forcing 0 (call #%u)\n",
+	    class_getName(object_getClass(self)), (long) mode, calls_setcurmode);
+	if (orig_setCurrentMode != NULL) {
+		((void (*)(id, SEL, hakios_NSInteger)) orig_setCurrentMode)(self, _cmd, 0);
+	}
+}
+
+/* one method, one hook, one log line; returns 1 when the method was found and swapped */
+static int
+dispmode_hook_method(Class cls, SEL sel, IMP imp, void **save)
+{
+	Method m = class_getInstanceMethod(cls, sel);
+
+	if (m == NULL || *save != NULL) {
+		return 0;
+	}
+	*save = (void *) method_setImplementation(m, imp);
+	say("hakios: DISPMODE hook %s %s installed\n", class_getName(cls), sel_getName(sel));
+	return 1;
+}
+
+static void
+dispmode_hook_one_class(Class cls, BOOL check_int_return)
+{
+	static SEL selSetMode, selCurMode, selSetCurMode;
+	static SEL selDisUpd;
+
+	if (cls == NULL) {
+		return;
+	}
+	if (selSetMode == NULL) {
+		selSetMode = sel_registerName("setDisplayMode:");
+		selCurMode = sel_registerName("currentDisplayMode");
+		selSetCurMode = sel_registerName("setCurrentMode:");
+		selDisUpd = sel_registerName("setDisablesUpdates:");
+	}
+	dispmode_hook_method(cls, selSetMode, (IMP) hooked_setDisplayMode, &orig_setDisplayMode);
+	if (check_int_return) {
+		dispmode_hook_method(cls, selCurMode, (IMP) hooked_currentDisplayMode_int,
+		    &orig_currentDisplayMode_int);
+	} else {
+		dispmode_hook_method(cls, selCurMode, (IMP) hooked_currentDisplayMode_id,
+		    &orig_currentDisplayMode_id);
+	}
+	dispmode_hook_method(cls, selSetCurMode, (IMP) hooked_setCurrentMode, &orig_setCurrentMode);
+	/* the same force-NO gate the CAWindowServerDisplay path uses, now wherever it exists:
+	 * hooked_real_setDisablesUpdates keeps forcing NO through whatever orig it saved. */
+	{
+		Method m = class_getInstanceMethod(cls, selDisUpd);
+
+		if (m != NULL && orig_real_setDisablesUpdates == NULL) {
+			orig_real_setDisablesUpdates = (void (*)(id, SEL, BOOL)) method_setImplementation(
+			    m, (IMP) hooked_real_setDisablesUpdates);
+			say("hakios: DISPMODE hook %s setDisablesUpdates: force-NO installed\n",
+			    class_getName(cls));
+		}
+	}
+}
+
+static void
+hakios_install_display_mode_hooks(void)
+{
+	static int done;
+	static const char *const named[] = {
+		"CAWindowServerDisplay", "CAWindowServer", "BKDisplay", "CADisplay"
+	};
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+
+	if (done) {
+		return;
+	}
+	/* fix94: opt-in.  fix92 installed these unconditionally and the window server never
+	 * reached StartWindowServer again (fix92/fix93 logs: no "[Display] StartWindowServer",
+	 * no kick_display, no hb beacon -- 58 KB of bring-up lines missing versus fix91).  The
+	 * class sweep and the force-NO setDisablesUpdates: hook on CAWindowServerDisplay are the
+	 * only difference in that build, so they stay behind ca_dismode=1 until they are shown
+	 * to be safe. */
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0 ||
+	    strstr(arguments, "ca_dismode=1") == NULL) {
+		say("hakios: DISPMODE hooks off (ca_dismode=1 enables them)\n");
+		return;
+	}
+	done = 1;
+	for (unsigned i = 0; i < sizeof(named) / sizeof(named[0]); i++) {
+		dispmode_hook_one_class(objc_getClass(named[i]), NO);
+	}
+	/* the named list is a guess; sweep the runtime's own list for any other class that
+	 * implements one of the three mode selectors (first 8 hits).  Note: the methodList the
+	 * sweep reads is process-wide, so classes from every loaded image are seen here. */
+	{
+		int n = objc_getClassList(NULL, 0);
+
+		if (n > 0) {
+			Class *all = calloc((size_t) n, sizeof(Class));
+			int hooked = 0;
+
+			if (all != NULL) {
+				n = objc_getClassList(all, n);
+				for (int i = 0; i < n && hooked < 8; i++) {
+					/* class_getInstanceMethod sees inherited methods too, which would
+					 * pull in every NSObject subclass that merely inherits a stub. */
+					if (class_getInstanceMethod(all[i], sel_registerName("setDisplayMode:")) == NULL &&
+					    class_getInstanceMethod(all[i], sel_registerName("currentDisplayMode")) == NULL &&
+					    class_getInstanceMethod(all[i], sel_registerName("setCurrentMode:")) == NULL) {
+						continue;
+					}
+					dispmode_hook_one_class(all[i], YES);
+					hooked++;
+				}
+				free(all);
+			}
+			say("hakios: DISPMODE sweep done: %d extra class(es) scanned\n", hooked);
+		}
+	}
+	say("hakios: DISPMODE hooks up: setmode=%p curmode=%p setcurmode=%p\n",
+	    orig_setDisplayMode, orig_currentDisplayMode_id != NULL ?
+	    orig_currentDisplayMode_id : orig_currentDisplayMode_int, orig_setCurrentMode);
+	if (orig_setDisplayMode == NULL) {
+		say("hakios: DISPMODE setDisplayMode: NOT FOUND in any class\n");
+	}
+}
+
+static int safe_copy(uintptr_t from, void *into, size_t length);   /* defined below: read without taking a fault */
+
+/* fix89: the kick has many callers -- serverWithOptions calls it directly, and ten dispatch_after
+ * blocks fire it on the main queue; serverWithOptions itself is not guaranteed to run on that queue.
+ * The dump/scan state below is static and unsynchronised, and the kick drives -update and
+ * -[CATransaction flush], which should not re-enter each other from two threads.  Note: fix86revert's
+ * whole-stream log doubling is NOT this race (every line doubles, launchd's included) -- that sits in
+ * the kernel log transport; this lock only makes a second kicker wait its turn. */
+static pthread_mutex_t kick_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+hakios_kick_real_display(id disp, const char *why)
+{
+	SEL selBlanked = sel_registerName("isBlanked");
+	SEL selDisUpd = sel_registerName("disablesUpdates");
+	SEL selDis = sel_registerName("disabled");
+	SEL selUpdate = sel_registerName("update");
+
+	if (disp == nil) {
+		return;
+	}
+	pthread_mutex_lock(&kick_lock);
+	BOOL b = ((BOOL (*)(id, SEL)) objc_msgSend)(disp, selBlanked);
+	BOOL du = ((BOOL (*)(id, SEL)) objc_msgSend)(disp, selDisUpd);
+	BOOL d = ((BOOL (*)(id, SEL)) objc_msgSend)(disp, selDis);
+
+	/* fix66: the mode question.  "without a mode it draws nothing" -- if the kernel's mode
+	 * publish is good now, CADisplay has to show it: a non-nil curMode and at least one mode.
+	 * This is the same question the C++ side answers through selector 79 block 0x40, asked
+	 * from the object side, and safe_copy reads cost nothing. */
+	Class cadCls = objc_getClass("CADisplay");
+	id mainCad = cadCls != nil ? ((id (*)(id, SEL)) objc_msgSend)((id) cadCls, sel_registerName("mainDisplay")) : nil;
+	id curMode = mainCad != nil ? ((id (*)(id, SEL)) objc_msgSend)(mainCad, sel_registerName("currentMode")) : nil;
+	CFArrayRef modes = mainCad != nil ? ((CFArrayRef (*)(id, SEL)) objc_msgSend)(mainCad, sel_registerName("availableModes")) : NULL;
+	CFIndex modeCount = modes != NULL ? CFArrayGetCount(modes) : -1;
+
+	/* fix67: what mode exactly?  CFCopyDescription prints size and refresh rate. */
+	char modeDesc[128] = "nil";
+
+	if (curMode != nil) {
+		CFStringRef md = CFCopyDescription((CFTypeRef) curMode);
+
+		if (md != NULL) {
+			CFStringGetCString(md, modeDesc, sizeof(modeDesc), kCFStringEncodingUTF8);
+			CFRelease(md);
+		}
+	}
+
+	unsigned disp_id = 0, cad_id = 0;
+	if (disp != nil && class_getInstanceMethod(object_getClass(disp), sel_registerName("displayId")) != NULL) {
+		disp_id = ((unsigned (*)(id, SEL)) objc_msgSend)(disp, sel_registerName("displayId"));
+	}
+	if (mainCad != nil && class_getInstanceMethod(object_getClass(mainCad), sel_registerName("displayId")) != NULL) {
+		cad_id = ((unsigned (*)(id, SEL)) objc_msgSend)(mainCad, sel_registerName("displayId"));
+	}
+	say("hakios: kick_display(%s): disp=%p id=%u blank=%d disUpd=%d dis=%d CADisplay=%p id=%u curMode=%s modes=%ld "
+	    "(calls: ready=%u ignore=%u begin=%u finish=%u render=%u)\n",
+	    why, (void *) disp, disp_id, (int) b, (int) du, (int) d, (void *) mainCad, cad_id, modeDesc, (long) modeCount,
+	    calls_ready, calls_ignore, calls_begin, calls_finish, calls_render);
+
+	/*
+	 * fix67: find the C++ display behind the ObjC one and step on the starter motor.
+	 * fix66 proved _impl's first 64 bytes are a pthread_mutex ("MUTX" at every word): the real
+	 * CA::WindowServer::AppleCLCDDisplay pointer lives further in, so scan words[8..23] for a
+	 * pointer whose vtable is VT_APPLE_CLCD_DISPLAY + 0x10 (the first method slot of that
+	 * vtable).  Disassembling is_ready() out of the shared cache on the host (0x1882f0908)
+	 * showed it is not a query: with flags bit 0x8 set (a swap wait still pending) it calls
+	 * the IOMobileFramebuffer connection at this+0x318 with 0x80000003 -- the driver logs that
+	 * as selector 6, kFBMethodSwapWait, not the power request we first read into it -- clears
+	 * bit 0x8 when the wait returns, and returns !(flags & 4).  Nobody in backboardd ever
+	 * calls it (calls: ready=0), so we can call it ourselves -- from a periodic kick, not
+	 * here: inside serverWithOptions the server is still being constructed.
+	 */
+	static uintptr_t c_disp = 0;              /* the real AppleCLCDDisplay, once found */
+	static int prodded = 0;
+
+	/* fix77: off unless ca_prod=1.  fix76's forced flags made is_ready answer 1, but the
+	 * board died after it; until that is separated from the prod, the enumeration round
+	 * runs without it. */
+	if (hakios_ca_prod && c_disp != 0 && prodded < 6) {
+		prodded++;
+		uint64_t before = 0;
+
+		safe_copy(c_disp + 0x9f2, &before, sizeof(before));
+		say("hakios: PROD display=%p flags=%llx (bit0x8=%d bit0x4=%d) prod=%d/6 why=%s\n",
+		    (void *) c_disp, (unsigned long long) before,
+		    (int) ((before >> 3) & 1ULL), (int) ((before >> 2) & 1ULL),
+		    prodded, why);
+		/*
+		 * fix76: the starter motor, really engaged.  is_ready() asks one question of flags:
+		 * with bit 0x8 (a power change pending) it walks the IOMobileFramebuffer connection at
+		 * this+0x318 with 0x80000003 -- our selector 12, power ON -- and clears the bit when
+		 * the request succeeds; its return value is !(flags & 4).  The real one we found
+		 * (fix75: flags 0x11804804) has no 0x8 and has 0x4 -- power never requested, display
+		 * not ready, so backboardd's frame path has nothing to start.  Nothing else in the
+		 * process ever sets the request bit either (ready=0 calls in nine rounds).  So we set
+		 * the request and clear not-ready ourselves; is_ready does the rest through its own
+		 * code path.  If this+0x318 were not a connection, we get an access error at a known
+		 * address instead of a mystery -- which is also an answer.
+		 */
+		if (before != 0) {
+			uint64_t armed = (before | 0x8ULL) & ~0x4ULL;
+
+			*(volatile uint64_t *)((char *) (void *) c_disp + 0x9f2) = armed;
+		}
+		int rdy = orig_is_ready != NULL ? orig_is_ready((void *) c_disp) : -1;
+		uint64_t after = 0;
+
+		safe_copy(c_disp + 0x9f2, &after, sizeof(after));
+		say("hakios: prod %d: orig_is_ready(%p) = %d, flags %#llx -> %#llx (after: bit0x8=%d bit0x4=%d "
+		    "is_ready=%d)\n",
+		    prodded, (void *) c_disp, rdy, (unsigned long long) before, (unsigned long long) after,
+		    (int) ((after >> 3) & 1ULL), (int) ((after >> 2) & 1ULL), (int) (!(after & 0x4ULL)));
+	}
+
+	/*
+	 * fix75: the fix67 scan ran exactly once -- at the serverWithOptions moment, before the
+	 * server finishes building its hardware display -- and looked only at words[8..23].  On
+	 * fix68/74 _impl held one pointer, to CA::WindowServer's EAGLServer: the AppleCLCDDisplay
+	 * may not hang off the ObjC display's _impl at all but off the server side.  So: scan on
+	 * every kick until found, widen to words[8..95], and walk the EAGLServer object's own
+	 * fields one dereference deep.  The full dump prints once; later rounds print only hits.
+	 */
+	static unsigned scan_round = 0;
+
+	scan_round++;
+	if (c_disp == 0 && (scan_round == 1 || (scan_round & 7) == 0)) {
+		uintptr_t impl = 0;
+
+		if (safe_copy((uintptr_t) disp + 8, &impl, sizeof(impl)) && impl != 0) {
+			uintptr_t words[96];
+
+			bzero(words, sizeof(words));
+			if (safe_copy(impl, words, sizeof(words))) {
+				if (scan_round == 1) {
+					for (int i = 8; i < 64; i += 4) {
+						say("hakios: disp->_impl[+%#x..+%#x]: %#lx %#lx %#lx %#lx\n",
+						    i * 8, (i + 3) * 8,
+						    (unsigned long) words[i], (unsigned long) words[i + 1],
+						    (unsigned long) words[i + 2], (unsigned long) words[i + 3]);
+					}
+				}
+				for (int i = 8; i < 96 && c_disp == 0; i++) {
+					uintptr_t vt = 0;
+
+					if (words[i] > 0x100000000UL && safe_copy(words[i], &vt, sizeof(vt))) {
+						uintptr_t unslid_vt = vt - slide;
+
+						if (scan_round == 1) {
+							say("hakios:   disp->_impl[%d] (%#lx) -> *ptr=%#lx (unslid %#lx)\n",
+							    i, (unsigned long) words[i], (unsigned long) vt, (unsigned long) unslid_vt);
+						}
+						if (unslid_vt == VT_APPLE_CLCD_DISPLAY + 0x10) {
+							c_disp = words[i];
+						} else if (unslid_vt == VT_EAGL_SERVER + 0x10) {
+							for (unsigned off = 0x10; off < 0x100 && c_disp == 0; off += 8) {
+								uintptr_t f = 0, fvt = 0;
+
+								if (safe_copy(words[i] + off, &f, sizeof(f)) && f > 0x100000000UL &&
+								    safe_copy(f, &fvt, sizeof(fvt)) &&
+								    fvt - slide == VT_APPLE_CLCD_DISPLAY + 0x10) {
+									c_disp = f;
+									say("hakios:   FOUND AppleCLCDDisplay=%p via _impl[%d]->EAGLServer+%#x!\n",
+									    (void *) c_disp, i, off);
+								}
+							}
+						}
+						if (c_disp != 0) {
+							uint64_t dflags = 0;
+							uint8_t b233 = 0;
+
+							safe_copy(c_disp + 0x9f2, &dflags, sizeof(dflags));
+							safe_copy(c_disp + 0x233, &b233, sizeof(b233));
+							say("hakios:   FOUND AppleCLCDDisplay=%p! flags=%#llx b233=%#x (ready will be prodded)\n",
+							    (void *) c_disp, (unsigned long long) dflags, (unsigned) b233);
+							/* fix93: guarantee the ca_prod path runs at least once without
+							 * waiting for the 3s periodic kick: one dispatch_after, 2s out,
+							 * calling the very same kick function on the main queue. */
+							if (hakios_ca_prod) {
+								id prod_disp = disp;
+
+								CFRetain((CFTypeRef) prod_disp);
+								dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t) 2 * NSEC_PER_SEC),
+								    dispatch_get_main_queue(), ^{
+									hakios_kick_real_display(prod_disp, "ca_prod_direct_2s");
+								});
+								say("hakios: PROD armed: direct kick scheduled at +2s (ca_prod=1)\n");
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if (orig_real_setDisablesUpdates) {
+		orig_real_setDisablesUpdates(disp, sel_registerName("setDisablesUpdates:"), NO);
+	}
+	if (orig_real_setDisabled) {
+		orig_real_setDisabled(disp, sel_registerName("setDisabled:"), NO);
+	}
+	if (orig_real_setBlanked) {
+		orig_real_setBlanked(disp, sel_registerName("setBlanked:"), NO);
+	}
+	if (class_respondsToSelector(object_getClass(disp), selUpdate)) {
+		((void (*)(id, SEL)) objc_msgSend)(disp, selUpdate);
+	}
+	/* fix67: push whatever is pending through the client side too. */
+	Class caTx = objc_getClass("CATransaction");
+
+	if (caTx != nil && class_respondsToSelector(object_getClass((id) caTx), sel_registerName("flush"))) {
+		((void (*)(id, SEL)) objc_msgSend)((id) caTx, sel_registerName("flush"));
+	}
+	pthread_mutex_unlock(&kick_lock);
+}
+
 static id hooked_serverWithOptions(id self, SEL _cmd, id options) {
-	say("hakios: +[CAWindowServer serverWithOptions:%p] ENTER (real QuartzCore)\n", (void *)options);
-	id srv = orig_serverWithOptions ? orig_serverWithOptions(self, _cmd, options) : nil;
-	say("hakios: +[CAWindowServer serverWithOptions:] DONE -> %p\n", (void *)srv);
+	/*
+	 * fix66: hand the server its own options back with only the freeze key removed.  fix65 passed
+	 * nil wholesale, which is a blunt instrument: whatever else StartWindowServer put in that
+	 * dictionary (display lists, flags) vanished with it.  Describe it first -- what backboardd
+	 * really asks for has never been on the record.
+	 */
+	CFMutableDictionaryRef cleanOpts = NULL;
+
+	if (options != nil) {
+		CFStringRef desc = CFCopyDescription((CFTypeRef) options);
+
+		if (desc != NULL) {
+			char buf[256] = "?";
+
+			CFStringGetCString(desc, buf, sizeof(buf), kCFStringEncodingUTF8);
+			say("hakios: +[CAWindowServer serverWithOptions:] orig options = %s\n", buf);
+			CFRelease(desc);
+		}
+		if (CFGetTypeID((CFTypeRef) options) == CFDictionaryGetTypeID()) {
+			cleanOpts = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, (CFDictionaryRef) options);
+			if (cleanOpts != NULL) {
+				/* fix67: fix66's log named the key -- it is spelled with a SMALL d:
+				 * "disableUpdatesOnMainDisplay = 1;".  The capital-D spellings never matched
+				 * and the freeze flag went through untouched (disUpd=1 at birth). */
+				CFDictionaryRemoveValue(cleanOpts, CFSTR("disableUpdatesOnMainDisplay"));
+				CFDictionaryRemoveValue(cleanOpts, CFSTR("DisableUpdatesOnMainDisplay"));
+				CFDictionaryRemoveValue(cleanOpts, CFSTR("kCAWindowServerDisableUpdatesOnMainDisplay"));
+			}
+		}
+	}
+	id passOpts = (cleanOpts != NULL && CFDictionaryGetCount(cleanOpts) > 0) ? (id) cleanOpts : nil;
+	id srv = orig_serverWithOptions ? orig_serverWithOptions(self, _cmd, passOpts) : nil;
+
+	if (cleanOpts != NULL) {
+		CFRelease(cleanOpts);
+	}
+	say("hakios: +[CAWindowServer serverWithOptions:] DONE -> %p\n", (void *) srv);
+	if (srv != nil) {
+		CFArrayRef disps = ((CFArrayRef (*)(id, SEL)) objc_msgSend)(srv, sel_registerName("displays"));
+		CFIndex count = disps ? CFArrayGetCount(disps) : 0;
+
+		say("hakios: CAWindowServer has %ld display(s)\n", (long) count);
+		if (count > 0) {
+			id disp = (id) CFArrayGetValueAtIndex(disps, 0);
+			Class dCls = object_getClass(disp);
+
+			say("hakios: main display=%p class=%s\n", (void *) disp, dCls ? class_getName(dCls) : "?");
+			Method mBlank = class_getInstanceMethod(dCls, sel_registerName("setBlanked:"));
+			if (mBlank != NULL && orig_real_setBlanked == NULL) {
+				orig_real_setBlanked = (void (*)(id, SEL, BOOL)) method_setImplementation(
+				    mBlank, (IMP) hooked_real_setBlanked);
+			}
+			Method mDisUpd = class_getInstanceMethod(dCls, sel_registerName("setDisablesUpdates:"));
+			if (mDisUpd != NULL && orig_real_setDisablesUpdates == NULL) {
+				orig_real_setDisablesUpdates = (void (*)(id, SEL, BOOL)) method_setImplementation(
+				    mDisUpd, (IMP) hooked_real_setDisablesUpdates);
+			}
+			Method mDis = class_getInstanceMethod(dCls, sel_registerName("setDisabled:"));
+			if (mDis != NULL && orig_real_setDisabled == NULL) {
+				orig_real_setDisabled = (void (*)(id, SEL, BOOL)) method_setImplementation(
+				    mDis, (IMP) hooked_real_setDisabled);
+			}
+			hakios_kick_real_display(disp, "serverWithOptions");
+			CFRetain((CFTypeRef) disp);
+			for (int delay_s = 3; delay_s <= 30; delay_s += 3) {
+				dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t) delay_s * NSEC_PER_SEC),
+				    dispatch_get_main_queue(), ^{
+					hakios_kick_real_display(disp, "periodic_unblank");
+				});
+			}
+		}
+	}
 	return srv;
 }
 
@@ -2093,6 +2914,9 @@ cawindowserver_trace_fixes(void)
 	} else {
 		say("hakios: CAWindowServer class not found\n");
 	}
+	/* dispmode: same init path, before the server is asked for: the mode selectors have to be
+	 * hooked before StartWindowServer's first setDisplayMode:/currentDisplayMode round. */
+	hakios_install_display_mode_hooks();
 }
 
 /* ============================================================================
@@ -2253,7 +3077,15 @@ static int
 hakios_cache_mappings(struct hakios_cache_mapping *into, int max)
 {
 	uint8_t head[0x20];
-	const void *cache = _dyld_get_shared_cache_range(NULL);
+	/*
+	 * fix65: this passed NULL, and iOS 16.5's dyld writes the size without checking:
+	 * _dyld_get_shared_cache_range (libdyld's APIs, unslid 0x1a45d0928) stores *mappedSize
+	 * unconditionally, so asking it for the range with NULL faulted at 0x0 -- si_addr 0x0,
+	 * pc 0x1a45d0928 -- and that was the real killer of every backboardd generation from
+	 * fix55 to fix64, not the export trie.  Always hand it a real variable.
+	 */
+	size_t cache_len = 0;
+	const void *cache = _dyld_get_shared_cache_range(&cache_len);
 	uint32_t offset;
 	uint32_t count;
 	int n;
@@ -2967,10 +3799,25 @@ my_hid_clientConnectionManager(id self, SEL cmd)
 }
 
 /* ============================================================================
- * 6. INTERPOSITION: FAST-PATH BYPASS FOR OSCARD & COREACCESSORIES
+ * 6. INTERPOSITION: FAST-PATH BYPASS FOR OSCARD, COREACCESSORIES & CFPREFSD
  * ============================================================================ */
 typedef void * xpc_connection_t;
+typedef void * xpc_object_t;
+extern void *xpc_get_type(xpc_object_t object);
+extern const char *xpc_type_get_name(void *type);
+extern char *xpc_copy_description(xpc_object_t object);
 extern xpc_connection_t xpc_connection_create_mach_service(const char *name, void *targetq, uint64_t flags);
+extern xpc_object_t xpc_connection_send_message_with_reply_sync(xpc_connection_t connection, xpc_object_t message);
+extern const char *xpc_connection_get_name(xpc_connection_t connection);
+extern xpc_object_t xpc_dictionary_create(const char * const *keys, const xpc_object_t *values, size_t count);
+extern void xpc_dictionary_set_value(xpc_object_t xdict, const char *key, xpc_object_t value);
+extern void xpc_dictionary_set_uint64(xpc_object_t xdict, const char *key, uint64_t value);
+extern void xpc_release(xpc_object_t object);
+extern uint64_t xpc_dictionary_get_uint64(xpc_object_t xdict, const char *key);
+extern int pthread_main_np(void);
+extern xpc_object_t xpc_retain(xpc_object_t object);
+extern void xpc_connection_resume(xpc_connection_t connection);
+extern void xpc_connection_activate(xpc_connection_t connection);
 extern int CoreAccessoriesInitForHID(void);
 
 static int my_CoreAccessoriesInitForHID(void)
@@ -2979,14 +3826,194 @@ static int my_CoreAccessoriesInitForHID(void)
 	return 0;
 }
 
+static int hakios_daemon_should_bypass_xpc(const char *name)
+{
+	const char *prog = getprogname();
+	if (name == NULL) {
+		/* fix149: the anonymous lsd call is made by SpringBoard, not by lsd;
+		 * the lsd-side fix147 bypass only stalled lsd's own startup.  Leave lsd
+		 * alone and let inject_sb.c answer the SpringBoard call. */
+		return 0;
+	}
+	/* /usr/sbin/cfprefsd imajda yok; runningboardd/backboardd senkron cfprefsd
+	 * cagrisinda sonsuza dek mach_msg2_trap icinde kilitlenmesin (fix136). */
+	if (strcmp(name, "com.apple.cfprefsd.daemon") == 0 ||
+	    strcmp(name, "com.apple.cfprefsd.agent") == 0 ||
+	    strcmp(name, "com.apple.cfprefsd.daemon.system") == 0 ||
+	    strcmp(name, "com.apple.mobileactivationd") == 0 ||
+	    strcmp(name, "com.apple.diagnosticd") == 0 ||
+	    strcmp(name, "com.apple.analyticsd") == 0 ||
+	    strcmp(name, "com.apple.powerlog.plxpclogger.xpc") == 0) {
+		return 1;
+	}
+	if (prog != NULL && strcmp(prog, "runningboardd") == 0) {
+		if (strcmp(name, "com.apple.containermanagerd") == 0 ||
+		    strcmp(name, "com.apple.lsd.mapdb") == 0 ||
+		    strcmp(name, "com.apple.mobile.keybagd.xpc") == 0 ||
+		    strcmp(name, "com.apple.mobile.keybagd.UserManager.xpc") == 0) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static xpc_connection_t my_xpc_connection_create_mach_service(const char *name, void *targetq, uint64_t flags)
 {
 	if (name && (strcmp(name, "com.apple.oscard") == 0 ||
-	             strcmp(name, "com.apple.ACCHWComponentAuthService") == 0)) {
-		say("hakios: xpc_connection_create_mach_service(%s) -> fast NULL\n", name);
+	             strcmp(name, "com.apple.ACCHWComponentAuthService") == 0 ||
+	             strcmp(name, "com.apple.mobileactivationd") == 0 ||
+	             strcmp(name, "com.apple.cfprefsd.daemon") == 0 ||
+	             strcmp(name, "com.apple.cfprefsd.agent") == 0)) {
+		say("hakios: %s xpc_connection_create_mach_service(%s) -> fast NULL\n",
+		    getprogname() ? getprogname() : "?", name);
 		return (xpc_connection_t)0;
 	}
+	if (name && (strcmp(name, "com.apple.backboard.display.services") == 0 ||
+	             strcmp(name, "com.apple.runningboard") == 0 ||
+	             strncmp(name, "com.apple.lsd", 13) == 0)) {
+		say("hakios: %s xpc_connection_create_mach_service(%s) flags %#llx\n",
+		    getprogname() ? getprogname() : "?", name, (unsigned long long)flags);
+	}
 	return xpc_connection_create_mach_service(name, targetq, flags);
+}
+
+static xpc_object_t my_xpc_connection_send_message_with_reply_sync(xpc_connection_t connection, xpc_object_t message)
+{
+	const char *name = connection != NULL ? xpc_connection_get_name(connection) : NULL;
+	const char *prog = getprogname();
+	static unsigned daemon_sync_logged;
+	static xpc_object_t lsd_cm_class10;
+
+
+	{
+		int bypass = hakios_daemon_should_bypass_xpc(name);
+		static unsigned bypass_logged;
+		if (bypass == 2) {
+			void *sym = dlsym(RTLD_DEFAULT, "xpc_error_connection_interrupted");
+			xpc_object_t err = sym != NULL ? *(xpc_object_t *)sym : NULL;
+			if (bypass_logged < 24) {
+				bypass_logged++;
+				say("hakios: %s fix147 lsd anonymous bypass -> XPC error %p (sym %p)\n",
+				    prog ? prog : "?", err, sym);
+			}
+			if (err != NULL) {
+				return xpc_retain(err);
+			}
+			say("hakios: %s fix147 XPC error symbol missing; empty dict\n",
+			    prog ? prog : "?");
+			return xpc_dictionary_create(NULL, NULL, 0);
+		}
+		if (bypass) {
+			if (bypass_logged < 24) {
+				bypass_logged++;
+				say("hakios: %s fix138 xpc sync bypass \"%s\" -> empty dict\n",
+				    prog ? prog : "?", name ? name : "?");
+			}
+			return xpc_dictionary_create(NULL, NULL, 0);
+		}
+	}
+	if (prog != NULL &&
+	    (strcmp(prog, "runningboardd") == 0 || strcmp(prog, "lsd") == 0) &&
+	    daemon_sync_logged < 200) {
+		daemon_sync_logged++;
+		say("hakios: %s xpc sync send[%u] -> \"%s\"\n",
+		    prog, daemon_sync_logged, name ? name : "(anon)");
+	}
+	if (prog != NULL && strcmp(prog, "lsd") == 0 && name != NULL &&
+	    (strcmp(name, "com.apple.containermanagerd") == 0 ||
+	     strcmp(name, "com.apple.mobile.usermanagerd.xpc") == 0)) {
+		static unsigned lsd_req_logged;
+		if (lsd_req_logged < 200) {
+			char *desc = xpc_copy_description(message);
+			lsd_req_logged++;
+			say("hakios: lsd %s request[%u] main=%d: %.600s\n", name,
+			    lsd_req_logged, pthread_main_np(), desc != NULL ? desc : "(null)");
+			free(desc);
+		}
+	}
+	/* fix157: the anonymous lsd handler asks containermanagerd for the
+	 * com.apple.installd class-10 container.  Reuse the real class-10 reply
+	 * that lsd already got on the main thread during startup. */
+	if (prog != NULL && strcmp(prog, "lsd") == 0 && name != NULL &&
+	    strcmp(name, "com.apple.containermanagerd") == 0 && !pthread_main_np()) {
+		static unsigned fix157_logged;
+		if (lsd_cm_class10 != NULL) {
+			if (fix157_logged < 32) {
+				fix157_logged++;
+				say("hakios: lsd fix157 worker containermanagerd -> cached class10 reply %p\n",
+				    lsd_cm_class10);
+			}
+			return xpc_retain(lsd_cm_class10);
+		}
+		if (fix157_logged < 32) {
+			fix157_logged++;
+			say("hakios: lsd fix157 worker containermanagerd -> no cached class10 reply\n");
+		}
+	}
+	{
+		xpc_object_t reply = xpc_connection_send_message_with_reply_sync(connection, message);
+
+		if (prog != NULL && strcmp(prog, "lsd") == 0 && daemon_sync_logged < 200) {
+			void *type = reply != NULL ? xpc_get_type(reply) : NULL;
+
+			say("hakios: lsd sync reply[%u] -> %s\n", daemon_sync_logged,
+			    type != NULL ? xpc_type_get_name(type) : "null");
+			if (name != NULL &&
+			    (strcmp(name, "com.apple.containermanagerd") == 0 ||
+			     strcmp(name, "com.apple.mobile.usermanagerd.xpc") == 0)) {
+				static unsigned lsd_rep_logged;
+				if (lsd_rep_logged < 40 && reply != NULL) {
+					char *desc = xpc_copy_description(reply);
+					lsd_rep_logged++;
+					say("hakios: lsd %s reply[%u]: %.600s\n", name, lsd_rep_logged,
+					    desc != NULL ? desc : "(null)");
+					free(desc);
+				}
+			}
+		}
+		if (prog != NULL && strcmp(prog, "lsd") == 0 && name != NULL &&
+		    strcmp(name, "com.apple.containermanagerd") == 0 && reply != NULL &&
+		    xpc_get_type(reply) != NULL &&
+		    strcmp(xpc_type_get_name(xpc_get_type(reply)), "dictionary") == 0 &&
+		    xpc_dictionary_get_uint64(message, "ContainerClass") == 10) {
+			if (lsd_cm_class10 != NULL)
+				xpc_release(lsd_cm_class10);
+			lsd_cm_class10 = xpc_retain(reply);
+			say("hakios: lsd fix157 cached class10 containermanagerd reply %p\n",
+			    lsd_cm_class10);
+		}
+		return reply;
+	}
+}
+
+static void my_xpc_connection_resume(xpc_connection_t connection)
+{
+	const char *prog = getprogname();
+	if (prog != NULL && strcmp(prog, "runningboardd") == 0 && connection != NULL) {
+		static unsigned rbd_resume_logged;
+		if (rbd_resume_logged < 32) {
+			const char *name = xpc_connection_get_name(connection);
+			rbd_resume_logged++;
+			say("hakios: rbd xpc_connection_resume[%u] conn=%p name=\"%s\"\n",
+			    rbd_resume_logged, connection, name ? name : "(anon/peer)");
+		}
+	}
+	xpc_connection_resume(connection);
+}
+
+static void my_xpc_connection_activate(xpc_connection_t connection)
+{
+	const char *prog = getprogname();
+	if (prog != NULL && strcmp(prog, "runningboardd") == 0 && connection != NULL) {
+		static unsigned rbd_activate_logged;
+		if (rbd_activate_logged < 32) {
+			const char *name = xpc_connection_get_name(connection);
+			rbd_activate_logged++;
+			say("hakios: rbd xpc_connection_activate[%u] conn=%p name=\"%s\"\n",
+			    rbd_activate_logged, connection, name ? name : "(anon/peer)");
+		}
+	}
+	xpc_connection_activate(connection);
 }
 
 __attribute__((used)) static struct {
@@ -2994,6 +4021,9 @@ __attribute__((used)) static struct {
 } hakios_interposes[] __attribute__((section("__DATA,__interpose"))) = {
 	{ (const void *)my_CoreAccessoriesInitForHID, (const void *)CoreAccessoriesInitForHID },
 	{ (const void *)my_xpc_connection_create_mach_service, (const void *)xpc_connection_create_mach_service },
+	{ (const void *)my_xpc_connection_send_message_with_reply_sync, (const void *)xpc_connection_send_message_with_reply_sync },
+	{ (const void *)my_xpc_connection_resume, (const void *)xpc_connection_resume },
+	{ (const void *)my_xpc_connection_activate, (const void *)xpc_connection_activate },
 };
 
 static void
@@ -3147,6 +4177,1124 @@ opengl_es(void)
 	 * CoreAnimation must use its built-in CPU Software Renderer (sw_new_context). */
 }
 
+/* ---- fix107/fix108: main-thread samplers (backboardd, logd) ------------------------------------- */
+
+/*
+ * fix107 found backboardd's main thread blocked, for tens of seconds, in a Mach send made by
+ * libsystem_trace: BackBoardServices' os_log_create("com.apple.BackBoard", "Common") registers the
+ * log object with logd, whose receive queue is not drained.  While the main thread waits there,
+ * the display-services MIG server it also runs never answers SpringBoard (msgh_id 0x5b9171) and
+ * launchd's guard kills SpringBoard.  fix108 samples both sides: backboardd's main thread (the
+ * blocked send, the message itself, the remote port's kobject, the thread list) and logd's
+ * (where it is instead of draining).  A line is written once: stderr already is the console.
+ */
+static volatile unsigned bbd_mainq_beats, logd_mainq_beats;
+
+typedef struct {
+	uint64_t x[29];
+	uint64_t fp;
+	uint64_t lr;
+	uint64_t sp;
+	uint64_t pc;
+	uint32_t cpsr;
+	uint32_t flags;
+} watch_thread_state64_t;
+
+struct watch {
+	const char *who;                        /* "bbd" or "logd" */
+	mach_port_t thread;
+	volatile unsigned *beats;
+	unsigned dumps;
+	uint64_t tid;                           /* thread_id, to tell a dead thread from a dead name */
+	unsigned dump_every;                    /* seconds between all-thread dumps, 0 = never */
+	unsigned scan_every;                    /* seconds between port scans, 0 = never */
+};
+
+static struct watch bbd_watch = { "bbd", MACH_PORT_NULL, &bbd_mainq_beats, 0, 0, 10, 10 };
+static struct watch logd_watch = { "logd", MACH_PORT_NULL, &logd_mainq_beats, 0, 0, 0, 0 };
+
+/* fix132: SpringBoard's sync "handshakeWithRequest:" to com.apple.runningboard never gets a
+ * reply; runningboardd (pid 6) is alive and initialized, so its threads are where the answer is. */
+static unsigned rbd_mainq_beats;
+static struct watch rbd_watch = { "rbd", MACH_PORT_NULL, &rbd_mainq_beats, 0, 0, 10, 10 };
+static unsigned lsd_mainq_beats;
+static struct watch lsd_watch = { "lsd", MACH_PORT_NULL, &lsd_mainq_beats, 0, 0, 10, 10 };
+
+static void say_once(const char *format, ...);
+
+/*
+ * fix110 candidate: does backboardd check "com.apple.backboard.display.services" in at all?
+ * If it does not, SpringBoard's message waits in launchd's dead-name queue and no thread of
+ * backboardd can answer it, however healthy the rest of the process looks.  Interposing the two
+ * bootstrap calls turns that question into a log line, and the port it names gets its own queue
+ * report in watch_scan_ports().
+ */
+extern kern_return_t bootstrap_check_in(mach_port_t bp, const char *service_name,
+    mach_port_t *service_port);
+extern kern_return_t bootstrap_register(mach_port_t bp, const char *service_name,
+    mach_port_t service_port);
+extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name,
+    mach_port_t *service_port);
+extern mach_port_t mach_reply_port(void);
+
+static mach_port_t bbd_service_port;
+
+typedef kern_return_t (*bootstrap_check_in_fn)(mach_port_t, const char *, mach_port_t *);
+typedef kern_return_t (*bootstrap_register_fn)(mach_port_t, const char *, mach_port_t);
+
+static kern_return_t
+hakios_bootstrap_check_in(mach_port_t bp, const char *service_name, mach_port_t *service_port)
+{
+	kern_return_t kr;
+
+	kr = bootstrap_check_in(bp, service_name, service_port);
+	say_once("hakios: %s check-in \"%s\" kr %d port %#x\n", getprogname(), service_name, kr,
+	    kr == KERN_SUCCESS ? *service_port : 0);
+	if (kr == KERN_SUCCESS && service_name != NULL &&
+	    strcmp(service_name, "com.apple.backboard.display.services") == 0) {
+		bbd_service_port = *service_port;
+	}
+	return kr;
+}
+
+static kern_return_t
+hakios_bootstrap_register(mach_port_t bp, const char *service_name, mach_port_t service_port)
+{
+	kern_return_t kr;
+
+	kr = bootstrap_register(bp, service_name, service_port);
+	say_once("hakios: %s register \"%s\" port %#x kr %d\n", getprogname(), service_name,
+	    service_port, kr);
+	if (kr == KERN_SUCCESS && service_name != NULL &&
+	    strcmp(service_name, "com.apple.backboard.display.services") == 0) {
+		bbd_service_port = service_port;
+	}
+	return kr;
+}
+
+__attribute__((used)) static struct {
+	const void *replacement;
+	const void *replacee;
+} hakios_bootstrap_interposers[] __attribute__((section("__DATA,__interpose"))) = {
+	{ (const void *)hakios_bootstrap_check_in, (const void *)bootstrap_check_in },
+	{ (const void *)hakios_bootstrap_register, (const void *)bootstrap_register },
+};
+
+static double
+watch_since_boot(void)
+{
+	mach_timebase_info_data_t tb;
+
+	mach_timebase_info(&tb);
+	return (double)mach_absolute_time() * (double)tb.numer / (double)tb.denom / 1e9;
+}
+
+/* one copy of a line: for these daemons stderr already is the console (say() writes both) */
+static void
+say_once(const char *format, ...)
+{
+	char line[1280];
+	va_list ap;
+	int n;
+
+	va_start(ap, format);
+	n = vsnprintf(line, sizeof(line), format, ap);
+	va_end(ap);
+	if (n > (int)sizeof(line) - 1) {
+		n = sizeof(line) - 1;
+	}
+	write(2, line, (size_t)n);
+	if (!isatty(2)) {
+		int cfd = open("/dev/console", O_WRONLY);
+
+		if (cfd >= 0) {
+			write(cfd, line, (size_t)n);
+			close(cfd);
+		}
+	}
+}
+
+static void
+watch_say_pc(const char *who, const char *what, uintptr_t pc)
+{
+	Dl_info info;
+	const char *name = "?";
+	uintptr_t base = 0;
+
+	if (pc != 0 && dladdr((void *)pc, &info) != 0) {
+		const char *slash = strrchr(info.dli_fname, '/');
+
+		name = slash ? slash + 1 : info.dli_fname;
+		base = (uintptr_t)info.dli_fbase;
+	}
+	say_once("hakios: %s %.1f %s %#lx = %s+%#lx (cache %#lx)\n", who, watch_since_boot(), what, pc,
+	    name, pc - base, pc - slide);
+}
+
+static void
+watch_say_chain(const char *who, uintptr_t fp)
+{
+	for (unsigned frame = 0; frame < 12 && fp >= 0x100000000UL && (fp & 7) == 0; frame++) {
+		uintptr_t pair[2];
+		vm_size_t got = 0;
+
+		if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, sizeof(pair), (vm_address_t)pair,
+		    &got) != KERN_SUCCESS || got < sizeof(pair)) {
+			break;
+		}
+		if (pair[1] != 0) {
+			watch_say_pc(who, "chain", pair[1] & 0x0000000fffffffffUL);
+		}
+		if (pair[0] <= fp) {
+			break;
+		}
+		fp = pair[0];
+	}
+}
+
+static void
+watch_say_strings(const char *who, const unsigned char *buf, unsigned len)
+{
+	char run[65];
+	unsigned n = 0;
+	unsigned said = 0;
+
+	for (unsigned i = 0; i <= len; i++) {
+		unsigned char c = i < len ? buf[i] : 0;
+
+		if (c >= 0x20 && c < 0x7f) {
+			if (n < sizeof(run) - 1) {
+				run[n++] = (char)c;
+			}
+			continue;
+		}
+		if (n >= 4 && said < 8) {
+			run[n] = 0;
+			say_once("hakios: %s msg str: %s\n", who, run);
+			said++;
+		}
+		n = 0;
+	}
+}
+
+static void
+watch_probe_port(const char *who, mach_port_name_t name)
+{
+	mach_port_type_t type = 0;
+	natural_t object_type = 0;
+	mach_vm_address_t object_addr = 0;
+	kobject_description_t description;
+
+	mach_port_type(mach_task_self(), name, &type);
+	memset(description, 0, sizeof(description));
+	if (mach_port_kobject_description(mach_task_self(), name, &object_type, &object_addr,
+	    description) == KERN_SUCCESS) {
+		say_once("hakios: %s port %#x type %#x kobject %#x addr %#llx says \"%s\"\n", who, name, type,
+		    object_type, (unsigned long long)object_addr, description);
+	} else {
+		say_once("hakios: %s port %#x type %#x: no kobject description\n", who, name, type);
+	}
+}
+
+/*
+ * The blocked message: header, first bytes, printable runs, then each descriptor.  OOL memory is
+ * read and scanned, OOL ports and port rights get their kobject description; the remote port of
+ * the header is named too -- the side that stopped draining is what all of this says.
+ */
+static void
+watch_dump_msg(const char *who, const watch_thread_state64_t *st)
+{
+	uint64_t option = st->x[1], bits_ss = st->x[2], ports = st->x[3];
+	uint64_t vou_id = st->x[4], dc_rn = st->x[5], rsize_pri = st->x[6];
+	uint32_t bits = (uint32_t)bits_ss, ssize = (uint32_t)(bits_ss >> 32);
+	uint32_t remote = (uint32_t)ports, local = (uint32_t)(ports >> 32);
+	uint32_t voucher = (uint32_t)vou_id, id = (uint32_t)(vou_id >> 32);
+	uint32_t dcount = (uint32_t)dc_rn, rname = (uint32_t)(dc_rn >> 32);
+	uint32_t rsize = (uint32_t)rsize_pri;
+	unsigned char buf[0x300];
+	vm_size_t got = 0;
+	unsigned want = ssize > sizeof(buf) ? sizeof(buf) : ssize;
+
+	say_once("hakios: %s msg opt %#llx bits %#x ssize %u remote %#x local %#x voucher %#x id %#x "
+	    "dcnt %u rname %#x rsize %u timeout %#llx\n", who, (unsigned long long)option, bits, ssize,
+	    remote, local, voucher, id, dcount, rname, rsize, (unsigned long long)st->x[7]);
+	if (want == 0 || st->x[0] < 0x100000000UL ||
+	    vm_read_overwrite(mach_task_self(), (vm_address_t)st->x[0], want, (vm_address_t)buf,
+	    &got) != KERN_SUCCESS || got < 8) {
+		return;
+	}
+	for (unsigned off = 0; off + 16 <= got && off < 64; off += 16) {
+		say_once("hakios: %s msg hex %08x %08x %08x %08x\n", who,
+		    *(uint32_t *)(buf + off), *(uint32_t *)(buf + off + 4),
+		    *(uint32_t *)(buf + off + 8), *(uint32_t *)(buf + off + 12));
+	}
+	watch_say_strings(who, buf, (unsigned)got);
+	for (unsigned d = 0; d < dcount && d < 8; d++) {
+		unsigned off = 24 + d * 16;
+		unsigned char *p;
+		unsigned type;
+
+		if (off + 16 > got) {
+			break;
+		}
+		p = buf + off;
+		type = p[11];
+		say_once("hakios: %s desc %u type %u words %08x %08x %08x %08x\n", who, d, type,
+		    *(uint32_t *)(p + 0), *(uint32_t *)(p + 4), *(uint32_t *)(p + 8),
+		    *(uint32_t *)(p + 12));
+		if (type == 1 /* OOL memory */) {
+			uint64_t address = *(uint64_t *)p;
+			uint32_t size = *(uint32_t *)(p + 12);
+			unsigned char ool[256];
+			vm_size_t ool_got = 0;
+			unsigned ool_want = size > sizeof(ool) ? sizeof(ool) : size;
+
+			if (address >= 0x100000000UL && ool_want > 0 &&
+			    vm_read_overwrite(mach_task_self(), (vm_address_t)address, ool_want,
+			    (vm_address_t)ool, &ool_got) == KERN_SUCCESS) {
+				watch_say_strings(who, ool, (unsigned)ool_got);
+			}
+		} else if (type == 2 /* OOL ports */) {
+			uint64_t address = *(uint64_t *)p;
+			uint32_t count = *(uint32_t *)(p + 12);
+			mach_port_name_t names[8];
+			vm_size_t names_got = 0;
+			unsigned names_want = count > 8 ? 8 : count;
+
+			if (address >= 0x100000000UL && names_want > 0 &&
+			    vm_read_overwrite(mach_task_self(), (vm_address_t)address,
+			    names_want * sizeof(mach_port_name_t), (vm_address_t)names,
+			    &names_got) == KERN_SUCCESS) {
+				for (unsigned k = 0; k < names_got / sizeof(mach_port_name_t); k++) {
+					watch_probe_port(who, names[k]);
+				}
+			}
+		} else if (type == 0 /* port right */) {
+			watch_probe_port(who, *(uint32_t *)p);
+		}
+	}
+	watch_probe_port(who, remote);
+}
+
+#define WATCH_TRAP_MACH_MSG2 0x1c1852ff0UL
+
+/*
+ * fix113: the probe moves into backboardd and gets a loopback in front of it.
+ *
+ * fix112 proved two things: the endpoint is healthy (the fire-and-forget send returned
+ * MACH_MSG_SUCCESS) and every guard named the reply port that had just been allocated as a
+ * MACH_PORT_RIGHT_RECEIVE (mach_port_type 0x20000, urefs 1).  The one difference left between
+ * the probe and every working send in the same log -- SpringBoard's own RPC and backboardd's
+ * threads -- is the call shape: they send and receive in one mach_msg (MACH_SEND_MSG|MACH_RCV_MSG,
+ * rcv_name == msgh_local_port); the probe sent with a reply port and rcv_name MACH_PORT_NULL.
+ *
+ * The loopback runs the whole exchange against our own ports first, with step 1 in exactly the
+ * display request's shape.  A fault there is ours; a fault only at the service is the endpoint's.
+ * Either way only backboardd dies, never SpringBoard.
+ *
+ * fix114: fix113 showed that the call shape makes no difference -- the combined send died with
+ * the same guard naming the reply port.  The source names the culprit: the display service is
+ * created with MPO_ENFORCE_REPLY_PORT_SEMANTICS (ipc_port.c:771, and the CA telemetry comment in
+ * ipc_kmsg.c), so ipc_right_copyin_check_reply() rejects a reply port that is not a *reply port*
+ * (ipc_right.c:2069).  mach_port_allocate(RECEIVE) produces a plain receive right.  The kernel
+ * marks a port as a reply port only when it is created with IPC_PORT_INIT_REPLY -- mach_reply_port.
+ */
+extern mach_port_name_t mach_reply_port(void);
+
+/*
+ * fix115: a port the kernel will recognise as a reply port.  mach_reply_port() does not: its
+ * trap allocates with IPC_PORT_INIT_MESSAGE_QUEUE only (ipc_tt.c:1424), so the port carries no
+ * reply marking and the display endpoint's enforced reply-port semantics rejects it.  Only
+ * MPO_REPLY_PORT (ipc_port.c:760) runs ip_mark_reply_port / ip_mark_provisional_reply_port.
+ */
+static mach_port_t
+watch_make_reply_port(void)
+{
+	mach_port_options_t options;
+	mach_port_t name = MACH_PORT_NULL;
+
+	memset(&options, 0, sizeof(options));
+	options.flags = MPO_REPLY_PORT;
+	if (mach_port_construct(mach_task_self(), &options, 0, &name) != KERN_SUCCESS) {
+		return MACH_PORT_NULL;
+	}
+	return name;
+}
+
+/* fix115: a local stand-in for the display endpoint: a port that enforces reply-port semantics,
+ * plus a send right so the probe can send to it the way it sends to the service (COPY_SEND). */
+static mach_port_t
+watch_make_enforced_port(void)
+{
+	mach_port_options_t options;
+	mach_port_t name = MACH_PORT_NULL;
+
+	memset(&options, 0, sizeof(options));
+	options.flags = MPO_ENFORCE_REPLY_PORT_SEMANTICS | MPO_INSERT_SEND_RIGHT;
+	if (mach_port_construct(mach_task_self(), &options, 0, &name) != KERN_SUCCESS) {
+		return MACH_PORT_NULL;
+	}
+	return name;
+}
+
+/*
+ * fix116: mach_msg with MACH_SEND_MSG|MACH_RCV_MSG receives into the same address it sends from.
+ * fix115 passed a 24-byte request with rcv_size 128, so the service's answer was written past
+ * the request and tripped the stack canary; the SIGABRT right after "combined kr 0" was ours,
+ * not the service's.  One buffer now carries both directions.
+ *
+ * watch_loopback runs one full exchange against a port of our own in the display request's
+ * shape.  mbits is the full header bits: 0x1514 for a bare receive right (MAKE_SEND is the only
+ * legal destination disposition there), 0x1513 for a port that also holds a send right (the
+ * service case, COPY_SEND).  A timeout on the first receive is the healthy answer: the send
+ * half passed the reply check and this single thread is the server that has not replied yet.
+ */
+static int
+watch_loopback(mach_port_t dest, uint32_t mbits, const char *tag)
+{
+	char buffer[384];
+	mach_msg_header_t *header = (mach_msg_header_t *)buffer;
+	mach_port_t reply = watch_make_reply_port();
+	mach_port_t from;
+	kern_return_t kr;
+
+	if (reply == MACH_PORT_NULL) {
+		say_once("hakios: bbd %s t=%.1f reply port alloc failed\n", tag, watch_since_boot());
+		return -1;
+	}
+	memset(buffer, 0, sizeof(buffer));
+	*(uint32_t *)(buffer + 0) = mbits;
+	*(uint32_t *)(buffer + 4) = 24;
+	*(uint32_t *)(buffer + 8) = dest;
+	*(uint32_t *)(buffer + 12) = reply;
+	*(uint32_t *)(buffer + 20) = 0x5b9171;
+	kr = mach_msg(header, MACH_SEND_MSG | MACH_RCV_MSG | MACH_SEND_TIMEOUT | MACH_RCV_TIMEOUT,
+	    24, sizeof(buffer), reply, 200, MACH_PORT_NULL);
+	say_once("hakios: bbd %s t=%.1f send kr %d (%s)\n", tag, watch_since_boot(), kr,
+	    mach_error_string(kr));
+	if (kr != MACH_RCV_TIMED_OUT && kr != KERN_SUCCESS) {
+		return -2;
+	}
+	memset(buffer, 0, sizeof(buffer));
+	kr = mach_msg(header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(buffer), dest, 200,
+	    MACH_PORT_NULL);
+	say_once("hakios: bbd %s t=%.1f dest rcv kr %d (%s)\n", tag, watch_since_boot(), kr,
+	    mach_error_string(kr));
+	if (kr != KERN_SUCCESS) {
+		return -3;
+	}
+	from = header->msgh_remote_port;
+	say_once("hakios: bbd %s t=%.1f got bits %#x size %u remote %#x local %#x id %#x\n", tag,
+	    watch_since_boot(), header->msgh_bits, header->msgh_size, from,
+	    header->msgh_local_port, header->msgh_id);
+	memset(buffer, 0, sizeof(buffer));
+	*(uint32_t *)(buffer + 0) = 0x00000012;   /* MOVE_SEND_ONCE to the reply port */
+	*(uint32_t *)(buffer + 4) = 24;
+	*(uint32_t *)(buffer + 8) = from;
+	*(uint32_t *)(buffer + 20) = 0x5b91d5;
+	kr = mach_msg(header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, 24, 0, MACH_PORT_NULL, 200,
+	    MACH_PORT_NULL);
+	say_once("hakios: bbd %s t=%.1f reply send kr %d (%s)\n", tag, watch_since_boot(), kr,
+	    mach_error_string(kr));
+	if (kr != KERN_SUCCESS) {
+		return -4;
+	}
+	memset(buffer, 0, sizeof(buffer));
+	kr = mach_msg(header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(buffer), reply, 200,
+	    MACH_PORT_NULL);
+	say_once("hakios: bbd %s t=%.1f reply rcv kr %d (%s)\n", tag, watch_since_boot(), kr,
+	    mach_error_string(kr));
+	if (kr != KERN_SUCCESS) {
+		return -5;
+	}
+	say_once("hakios: bbd %s t=%.1f REPLY bits %#x size %u id %#x\n", tag, watch_since_boot(),
+	    header->msgh_bits, header->msgh_size, header->msgh_id);
+	return 0;
+}
+
+static void *
+watch_service_probe(__unused void *argument)
+{
+	static const char service[] = "com.apple.backboard.display.services";
+	mach_port_t bootstrap = MACH_PORT_NULL, server = MACH_PORT_NULL;
+	mach_port_t inbox = MACH_PORT_NULL, reply = MACH_PORT_NULL;
+	char buffer[384];
+	mach_msg_header_t *header = (mach_msg_header_t *)buffer;
+	kern_return_t kr;
+
+	sleep(25);
+
+	/* fix113: one-shot gate.  A fault in our own loopback would kill backboardd again and
+	 * again; the marker keeps a bad recipe from turning into a respawn storm. */
+	{
+		int fd = open("/tmp/hakios-bbd-probe-done", O_CREAT | O_EXCL | O_WRONLY, 0644);
+
+		if (fd < 0) {
+			say_once("hakios: bbd probe t=%.1f mark errno %d (%s), skipping\n",
+			    watch_since_boot(), errno, strerror(errno));
+			if (errno == EEXIST) {
+				return NULL;
+			}
+		} else {
+			close(fd);
+			say_once("hakios: bbd probe t=%.1f mark created, running\n", watch_since_boot());
+		}
+	}
+
+	kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &inbox);
+	if (kr != KERN_SUCCESS) {
+		say_once("hakios: bbd loop t=%.1f inbox alloc kr %d\n", watch_since_boot(), kr);
+		return NULL;
+	}
+	{
+		mach_port_t enforced = watch_make_enforced_port();
+		mach_port_type_t type = 0;
+		mach_port_urefs_t refs = 0;
+		int plain, strict;
+
+		if (enforced != MACH_PORT_NULL) {
+			mach_port_type(mach_task_self(), enforced, &type);
+			mach_port_get_refs(mach_task_self(), enforced, MACH_PORT_RIGHT_SEND, &refs);
+		}
+		say_once("hakios: bbd loop t=%.1f inbox %#x enforced %#x type %#x send-urefs %u\n",
+		    watch_since_boot(), inbox, enforced, type, refs);
+
+		/* A: bare receive right, MAKE_SEND. */
+		plain = watch_loopback(inbox, 0x00001514, "loop");
+		/* B: the display endpoint's rule, locally: an enforcing destination with a send
+		 * right, COPY_SEND as on the wire, and a constructed reply port. */
+		strict = enforced != MACH_PORT_NULL ?
+		    watch_loopback(enforced, 0x00001513, "enf") : -9;
+		say_once("hakios: bbd loop t=%.1f plain %d strict %d\n", watch_since_boot(),
+		    plain, strict);
+	}
+	mach_port_mod_refs(mach_task_self(), inbox, MACH_PORT_RIGHT_RECEIVE, -1);
+
+	/* step 5: the real service, in the shape the loopback just proved. */
+	task_get_bootstrap_port(mach_task_self(), &bootstrap);
+	kr = bootstrap_look_up(bootstrap, service, &server);
+	say_once("hakios: bbd svc probe t=%.1f look up kr %d port %#x\n", watch_since_boot(), kr,
+	    server);
+	if (kr != KERN_SUCCESS) {
+		return NULL;
+	}
+	/* 5a: no reply port at all, so the reply-port check is not entered. */
+	memset(buffer, 0, sizeof(buffer));
+	*(uint32_t *)(buffer + 0) = 0x00000013;
+	*(uint32_t *)(buffer + 4) = 24;
+	*(uint32_t *)(buffer + 8) = server;
+	*(uint32_t *)(buffer + 20) = 0x5b9171;
+	kr = mach_msg(header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, 24, 0, MACH_PORT_NULL, 200,
+	    MACH_PORT_NULL);
+	say_once("hakios: bbd svc probe t=%.1f ff send kr %d (%s)\n", watch_since_boot(), kr,
+	    mach_error_string(kr));
+
+	/* 5b: the real request, with the reply port the endpoint insists on. */
+	reply = watch_make_reply_port();
+	{
+		mach_port_type_t type = 0;
+		mach_port_urefs_t refs = 0;
+
+		mach_port_type(mach_task_self(), reply, &type);
+		mach_port_get_refs(mach_task_self(), reply, MACH_PORT_RIGHT_RECEIVE, &refs);
+		say_once("hakios: bbd svc probe t=%.1f reply %#x (MPO_REPLY_PORT) type %#x urefs %u\n",
+		    watch_since_boot(), reply, type, refs);
+	}
+	if (reply == MACH_PORT_NULL) {
+		mach_port_deallocate(mach_task_self(), server);
+		return NULL;
+	}
+	memset(buffer, 0, sizeof(buffer));
+	*(uint32_t *)(buffer + 0) = 0x00001513;
+	*(uint32_t *)(buffer + 4) = 24;
+	*(uint32_t *)(buffer + 8) = server;
+	*(uint32_t *)(buffer + 12) = reply;
+	*(uint32_t *)(buffer + 20) = 0x5b9171;
+	say_once("hakios: bbd svc probe t=%.1f hdr bits 0x1513 remote %#x local %#x id 0x5b9171\n",
+	    watch_since_boot(), server, reply);
+	kr = mach_msg(header,
+	    MACH_SEND_MSG | MACH_RCV_MSG | MACH_SEND_TIMEOUT | MACH_RCV_TIMEOUT,
+	    24, sizeof(buffer), reply, 300, MACH_PORT_NULL);
+	say_once("hakios: bbd svc probe t=%.1f combined kr %d (%s)\n", watch_since_boot(), kr,
+	    mach_error_string(kr));
+	if (kr == KERN_SUCCESS) {
+		unsigned size = header->msgh_size;
+		unsigned words = (size <= sizeof(buffer)) ? (size + 3) / 4 : 0;
+
+		say_once("hakios: bbd svc probe t=%.1f reply bits %#x size %u remote %#x local %#x id %#x\n",
+		    watch_since_boot(), header->msgh_bits, size, header->msgh_remote_port,
+		    header->msgh_local_port, header->msgh_id);
+		if (words > 6) {
+			unsigned i;
+
+			for (i = 6; i < words && i < 18; i += 4) {
+				say_once("hakios: bbd svc probe body %u %#x %#x %#x %#x\n", i,
+				    *(uint32_t *)(buffer + i * 4),
+				    *(uint32_t *)(buffer + i * 4 + 4),
+				    *(uint32_t *)(buffer + i * 4 + 8),
+				    *(uint32_t *)(buffer + i * 4 + 12));
+			}
+		}
+	} else if (kr == MACH_RCV_TIMED_OUT) {
+		say_once("hakios: bbd svc probe t=%.1f sent, no reply (endpoint silent)\n",
+		    watch_since_boot());
+	}
+	mach_port_deallocate(mach_task_self(), server);
+
+	/* fix123: drive the swap pipeline by hand from the one thread we know runs.
+	 * CoreAnimation has never called kFBMethodSwapBegin (4) or kFBMethodSwapEnd (5), so the
+	 * kernel presenter thread has slept since boot.  Open the MiniIOMobileFramebuffer user
+	 * client, begin a swap, hand the driver the 0x46c-byte request, end it.
+	 * fix124: that request now names a real surface -- IOSurfaceCreate through the stock
+	 * framework (surf_test has proven it against MiniIOSurface), painted with four colour
+	 * quadrants and a white bar that moves one per swap.  Something changing on the panel
+	 * means the pixels travelled surface -> present() -> show() -> pushPanel for real. */
+	{
+		const char *fb_names[] = { "MiniIOMobileFramebuffer", "IOMobileFramebuffer",
+		    "AppleCLCD", NULL };
+		io_service_t fbservice = MACH_PORT_NULL;
+		io_connect_t fbconn = MACH_PORT_NULL;
+		kern_return_t fbkr;
+		int chosen = -1;
+
+		for (int i = 0; fb_names[i] != NULL; i++) {
+			fbservice = IOServiceGetMatchingService(kIOMasterPortDefault,
+			    IOServiceMatching(fb_names[i]));
+			if (fbservice != MACH_PORT_NULL) {
+				chosen = i;
+				break;
+			}
+		}
+		if (chosen < 0) {
+			say_once("hakios: fix123 no framebuffer service in IORegistry\n");
+			return NULL;
+		}
+		say_once("hakios: fix123 matched '%s' (service %#x)\n", fb_names[chosen], fbservice);
+		fbkr = IOServiceOpen(fbservice, mach_task_self(), 0, &fbconn);
+		if (fbkr != KERN_SUCCESS) {
+			say_once("hakios: fix123 IOServiceOpen kr %#x\n", fbkr);
+			return NULL;
+		}
+		{
+			uint64_t swap_id = 0;
+			uint32_t out_count = 1;
+			uint8_t *swap = calloc(1, 0x46c);
+			IOSurfaceRef surf = NULL;
+			uint32_t surf_sid = 0;
+			CFMutableDictionaryRef props;
+			CFNumberRef n;
+
+			/* the driver's own default surface: selector 3 hands out its real id (fix66),
+			 * which says MiniIOSurface is answering -- worth a line before we make our own */
+			{
+				uint64_t def_sid = 0;
+				uint32_t def_count = 1;
+
+				fbkr = IOConnectCallMethod(fbconn, 3, NULL, 0, NULL, 0, &def_sid,
+				    &def_count, NULL, NULL);
+				say_once("hakios: fix124 default surface sid %llu kr %#x\n",
+				    (unsigned long long) def_sid, fbkr);
+			}
+			props = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+			    &kCFTypeDictionaryValueCallBacks);
+			if (props != NULL) {
+				n = CFNumberCreate(NULL, kCFNumberIntType, &(int){ 1125 });
+				CFDictionarySetValue(props, kIOSurfaceWidth, n); CFRelease(n);
+				n = CFNumberCreate(NULL, kCFNumberIntType, &(int){ 2436 });
+				CFDictionarySetValue(props, kIOSurfaceHeight, n); CFRelease(n);
+				n = CFNumberCreate(NULL, kCFNumberIntType, &(int){ 'BGRA' });
+				CFDictionarySetValue(props, kIOSurfacePixelFormat, n); CFRelease(n);
+				n = CFNumberCreate(NULL, kCFNumberIntType, &(int){ 4 });
+				CFDictionarySetValue(props, kIOSurfaceBytesPerElement, n); CFRelease(n);
+				surf = IOSurfaceCreate(props);
+				CFRelease(props);
+			}
+			if (surf == NULL) {
+				say_once("hakios: fix124 IOSurfaceCreate got NULL\n");
+			} else {
+				surf_sid = (uint32_t) IOSurfaceGetID(surf);
+				say_once("hakios: fix124 surface id %u at %p, row %u, %u bytes\n",
+				    surf_sid, IOSurfaceGetBaseAddress(surf),
+				    IOSurfaceGetBytesPerRow(surf), IOSurfaceGetAllocSize(surf));
+			}
+			for (int frame = 0; surf != NULL && frame < 6; frame++) {
+				uint32_t *pixel;
+				uint32_t w = IOSurfaceGetWidth(surf), h = IOSurfaceGetHeight(surf);
+				uint32_t row_stride = IOSurfaceGetBytesPerRow(surf) / 4;
+
+				/* four quadrants -- red, green, blue, yellow -- and a white bar that
+				 * sits one fifth lower with every swap.  The word is A R G B in memory,
+				 * which is what the panel and the recorder both take (fix63). */
+				IOSurfaceLock(surf, 0, NULL);
+				pixel = (uint32_t *) IOSurfaceGetBaseAddress(surf);
+				for (uint32_t y = 0; y < h; y++) {
+					uint32_t *row = pixel + (size_t) y * row_stride;
+					uint32_t bar = (uint32_t) (frame * h / 6);
+
+					for (uint32_t x = 0; x < w; x++) {
+						uint32_t colour;
+
+						if (y < h / 2) {
+							colour = x < w / 2 ? 0xffff0000 : 0xff00ff00;
+						} else {
+							colour = x < w / 2 ? 0xff0000ff : 0xffffff00;
+						}
+						/* fix164: one quadrant per frame, so each swap is visibly
+						 * different on the panel and the test pattern itself names
+						 * which frames arrived */
+						if (frame == 0 && x >= w / 2 && y < h / 2) {
+							colour = 0xff000000;
+						} else if (frame == 1 && x < w / 2 && y >= h / 2) {
+							colour = 0xff000000;
+						} else if (frame == 2 && x >= w / 2 && y >= h / 2) {
+							colour = 0xff000000;
+						} else if (frame == 3 && x < w / 2 && y < h / 2) {
+							colour = 0xff000000;
+						} else if (frame == 4 && (x + y) % 64 < 32) {
+							colour = 0xff202020;
+						} else if (frame == 5) {
+							colour = 0xffffffff;
+						}
+						if (y >= bar && y < bar + h / 30) {
+							colour = 0xffffffff;
+						}
+						row[x] = colour;
+					}
+				}
+				IOSurfaceUnlock(surf, 0, NULL);
+				fbkr = IOConnectCallMethod(fbconn, 4, NULL, 0, NULL, 0, &swap_id,
+				    &out_count, NULL, NULL);
+				if (swap != NULL) {
+					*(uint32_t *)(swap + 0x50) = (uint32_t) swap_id;   /* SWAP_ID */
+					*(uint32_t *)(swap + 0x54) = surf_sid;   /* SWAP_SURFACE(0) */
+					*(uint32_t *)(swap + 0x104) = 1;         /* layer 0 present */
+					*(uint32_t *)(swap + 0x64 + 8) = 1125;  /* source w */
+					*(uint32_t *)(swap + 0x64 + 12) = 2436; /* source h */
+					*(uint32_t *)(swap + 0xa4) = 1;         /* enabled */
+					*(uint32_t *)(swap + 0xc4 + 8) = 1125;  /* dest w */
+					*(uint32_t *)(swap + 0xc4 + 12) = 2436; /* dest h */
+					fbkr = IOConnectCallMethod(fbconn, 5, NULL, 0, swap, 0x46c, NULL,
+					    NULL, NULL, NULL);
+				}
+				say("hakios: fix124 swap %d id %llu sid %u kr %#x\n", frame,
+				    (unsigned long long) swap_id, surf_sid, fbkr);
+				sleep(2);
+			}
+			free(swap);
+		}
+		IOServiceClose(fbconn);
+	}
+	return NULL;
+}
+
+static void
+watch_dump_threads(const char *who)
+{
+	thread_act_array_t threads = NULL;
+	mach_msg_type_number_t count = 0;
+	unsigned probes = 0;
+
+	if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
+		return;
+	}
+	say_once("hakios: %s threads %u\n", who, (unsigned)count);
+	for (mach_msg_type_number_t i = 0; i < count; i++) {
+		watch_thread_state64_t st;
+		mach_msg_type_number_t st_count = ARM_THREAD_STATE64_COUNT;
+
+		if (thread_get_state(threads[i], ARM_THREAD_STATE64, (thread_state_t)&st,
+		    &st_count) == KERN_SUCCESS) {
+			uint32_t remote = (uint32_t)st.x[3];
+			uint32_t options = (uint32_t)st.x[1];
+
+			say_once("hakios: %s thread %u t=%.1f pc %#lx lr %#lx fp %#lx x0 %#llx "
+			    "x1 %#llx x2 %#llx x3 %#llx x4 %#llx x5 %#llx x6 %#llx x7 %#llx\n",
+			    who, i, watch_since_boot(), (uintptr_t)st.pc, (uintptr_t)st.lr,
+			    (uintptr_t)st.fp, (unsigned long long)st.x[0],
+			    (unsigned long long)st.x[1], (unsigned long long)st.x[2],
+			    (unsigned long long)st.x[3], (unsigned long long)st.x[4],
+			    (unsigned long long)st.x[5], (unsigned long long)st.x[6],
+			    (unsigned long long)st.x[7]);
+			watch_say_pc(who, "thread", (uintptr_t)st.pc);
+			/*
+			 * A thread sitting in mach_msg2 with a send option is either passing through or
+			 * the stall itself.  The remote port's kobject and the caller chain say which:
+			 * two of them per dump is enough to name the services and the code paths.
+			 */
+			if ((uintptr_t)st.pc - slide == WATCH_TRAP_MACH_MSG2 && (options & 1) &&
+			    probes < 2) {
+				probes++;
+				watch_probe_port(who, remote);
+				watch_say_chain(who, (uintptr_t)st.fp);
+			}
+		}
+		mach_port_deallocate(mach_task_self(), threads[i]);
+	}
+	vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_t));
+}
+
+/*
+ * Is the main thread still in the task?  fix108's sampler saw thread_get_state fail and read it
+ * as logd's main thread dying; the same sample deallocated the send rights task_threads had just
+ * handed it, so the name may have gone instead.  The thread_id (THREAD_IDENTIFIER_INFO) survives
+ * the port name: if it is still in the list, the thread lives and only our name was stale.
+ * -1 means task_threads itself failed and says nothing.
+ */
+static int
+watch_thread_alive(struct watch *w)
+{
+	thread_act_array_t threads = NULL;
+	mach_msg_type_number_t count = 0;
+	int alive = 0;
+
+	if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
+		return -1;
+	}
+	for (mach_msg_type_number_t i = 0; i < count; i++) {
+		thread_identifier_info_data_t id;
+		mach_msg_type_number_t id_count = THREAD_IDENTIFIER_INFO_COUNT;
+
+		memset(&id, 0, sizeof(id));
+		if (thread_info(threads[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&id, &id_count) ==
+		    KERN_SUCCESS && id.thread_id == w->tid) {
+			/* the thread lives: keep this name, the old one may be what went bad */
+			mach_port_mod_refs(mach_task_self(), threads[i], MACH_PORT_RIGHT_SEND, 1);
+			w->thread = threads[i];
+			alive = 1;
+		}
+		mach_port_deallocate(mach_task_self(), threads[i]);
+	}
+	vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_t));
+	return alive;
+}
+
+/*
+ * The receive rights of this task and what is waiting on them.  A Mach port reports its queue,
+ * not the sender: a non-zero mps_msgcount is the difference between "the request arrived and
+ * nobody dequeued it" (the handler or its queue is stuck) and "the request never arrived" (the
+ * service endpoint is still somewhere else, e.g. queued at launchd).  The display-services
+ * request from SpringBoard is msgh_id 0x5b9171; if it is sitting in one of these queues, the
+ * queue number and name printed here are its location.
+ */
+/*
+ * fix135: fix133/fix134 found the runningboardd handshake request enqueued on one of its ports
+ * and never received, while the main thread waits on port set 0x903.  Two questions decide who
+ * is wrong: is the queued port a member of a port set (then the kernel's port-set receive never
+ * sees it), and does a one-message port/port-set round trip work in this process at all?  The
+ * first is asked here, the second by watch_portset_selftest().
+ */
+static void
+watch_portset_membership(const char *who, mach_port_name_t queued, mach_port_name_t *names,
+    mach_port_type_t *types, mach_msg_type_number_t count)
+{
+	for (mach_msg_type_number_t i = 0; i < count; i++) {
+		mach_port_name_t *members = NULL;
+		mach_msg_type_number_t mcount = 0;
+		mach_port_status_t ss;
+		mach_msg_type_number_t sc = MACH_PORT_RECEIVE_STATUS_COUNT;
+
+		if ((types[i] & MACH_PORT_TYPE_PORT_SET) == 0) {
+			continue;
+		}
+		if (mach_port_get_set_status(mach_task_self(), names[i], &members, &mcount) != KERN_SUCCESS) {
+			continue;
+		}
+		for (mach_msg_type_number_t j = 0; j < mcount; j++) {
+			if (members[j] != queued) {
+				continue;
+			}
+			if (mach_port_get_attributes(mach_task_self(), names[i],
+			    MACH_PORT_RECEIVE_STATUS, (mach_port_info_t)&ss, &sc) == KERN_SUCCESS) {
+				say("hakios: %s queued %#x is member %u of set %#x (set msgs %u seqno %u)\n",
+				    who, queued, (unsigned)j, names[i],
+				    (unsigned)ss.mps_msgcount, (unsigned)ss.mps_seqno);
+			} else {
+				say("hakios: %s queued %#x is member %u of set %#x\n", who,
+				    queued, (unsigned)j, names[i]);
+			}
+		}
+		vm_deallocate(mach_task_self(), (vm_address_t)members,
+		    mcount * sizeof(mach_port_name_t));
+	}
+}
+
+/* one message to ourselves, through a port and then through a port set */
+static void
+watch_portset_selftest(const char *who)
+{
+	static bool done;
+	mach_port_t port = MACH_PORT_NULL, set = MACH_PORT_NULL;
+	mach_msg_header_t *out;
+	char *in;
+	mach_msg_return_t sr, rr;
+	kern_return_t kr;
+
+	if (done) {
+		return;
+	}
+	done = true;
+	kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+	if (kr == KERN_SUCCESS) {
+		kr = mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND);
+	}
+	if (kr != KERN_SUCCESS) {
+		say("hakios: %s selftest: no port (%s)\n", who, mach_error_string(kr));
+		return;
+	}
+	out = calloc(1, sizeof(*out));
+	in = calloc(1, 256);
+	if (out == NULL || in == NULL) {
+		free(out);
+		free(in);
+		return;
+	}
+	out->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	out->msgh_size = sizeof(*out);
+	out->msgh_remote_port = port;
+	sr = mach_msg(out, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(*out), 0, MACH_PORT_NULL,
+	    100, MACH_PORT_NULL);
+	rr = mach_msg((mach_msg_header_t *)in, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, 256, port,
+	    1000, MACH_PORT_NULL);
+	say("hakios: %s selftest port: send %d (%s) recv %d (%s)\n", who, sr,
+	    mach_error_string(sr), rr, mach_error_string(rr));
+	if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_PORT_SET, &set) == KERN_SUCCESS &&
+	    mach_port_move_member(mach_task_self(), port, set) == KERN_SUCCESS) {
+		memset(in, 0, 256);
+		memset(out, 0, sizeof(*out));
+		out->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+		out->msgh_size = sizeof(*out);
+		out->msgh_remote_port = port;
+		sr = mach_msg(out, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(*out), 0,
+		    MACH_PORT_NULL, 100, MACH_PORT_NULL);
+		rr = mach_msg((mach_msg_header_t *)in, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, 256, set,
+		    1000, MACH_PORT_NULL);
+		say("hakios: %s selftest set: send %d (%s) recv %d (%s)\n", who, sr,
+		    mach_error_string(sr), rr, mach_error_string(rr));
+	} else {
+		say("hakios: %s selftest set: no port set\n", who);
+	}
+	if (set != MACH_PORT_NULL) {
+		mach_port_deallocate(mach_task_self(), set);
+	}
+	mach_port_deallocate(mach_task_self(), port);
+	free(out);
+	free(in);
+}
+
+/* fix136: what the runloop's receive set actually contains, and what the stranded port is.
+ * watch_portset_membership() says the queued port is in no set; this says which sets exist. */
+static void
+watch_portset_dump(const char *who, mach_port_name_t *names, mach_port_type_t *types,
+    mach_msg_type_number_t count)
+{
+	static bool done;
+
+	if (done) {
+		return;
+	}
+	done = true;
+	for (mach_msg_type_number_t i = 0; i < count; i++) {
+		mach_port_name_t *members = NULL;
+		mach_msg_type_number_t mcount = 0;
+
+		if ((types[i] & MACH_PORT_TYPE_PORT_SET) == 0) {
+			continue;
+		}
+		if (mach_port_get_set_status(mach_task_self(), names[i], &members, &mcount) != KERN_SUCCESS) {
+			continue;
+		}
+		say("hakios: %s set %#x members %u\n", who, names[i], (unsigned)mcount);
+		for (mach_msg_type_number_t j = 0; j < mcount && j < 8; j++) {
+			mach_port_type_t mtype = 0;
+
+			mach_port_type(mach_task_self(), members[j], &mtype);
+			say("hakios: %s set %#x member %u: %#x type %#x\n", who, names[i],
+			    (unsigned)j, members[j], (unsigned)mtype);
+		}
+		vm_deallocate(mach_task_self(), (vm_address_t)members,
+		    mcount * sizeof(mach_port_name_t));
+	}
+}
+
+static void
+watch_scan_ports(const char *who)
+{
+	mach_port_name_t *names = NULL;
+	mach_port_type_t *types = NULL;
+	mach_msg_type_number_t count = 0, type_count = 0;
+	kern_return_t kr;
+	unsigned receive = 0, queued = 0;
+
+	say_once("hakios: %s scan start t=%.1f\n", who, watch_since_boot());
+	watch_portset_selftest(who);
+	/* the types array is the same information mach_port_type() would give, per name */
+	kr = mach_port_names(mach_task_self(), &names, &count, &types, &type_count);
+	if (kr != KERN_SUCCESS) {
+		say_once("hakios: %s scan: mach_port_names kr %d (%s)\n", who, kr,
+		    mach_error_string(kr));
+		return;
+	}
+	if (type_count < count) {
+		count = type_count;
+	}
+	watch_portset_dump(who, names, types, count);
+	for (mach_msg_type_number_t i = 0; i < count; i++) {		mach_port_status_t status;
+		mach_msg_type_number_t scount = MACH_PORT_RECEIVE_STATUS_COUNT;
+
+		if ((types[i] & MACH_PORT_TYPE_RECEIVE) == 0) {
+			continue;
+		}
+		receive++;
+		if (mach_port_get_attributes(mach_task_self(), names[i], MACH_PORT_RECEIVE_STATUS,
+		    (mach_port_info_t)&status, &scount) != KERN_SUCCESS) {
+			continue;
+		}
+		if (status.mps_msgcount == 0) {
+			continue;
+		}
+		queued++;
+		{
+			mach_port_seqno_t seq = 0;
+			mach_msg_size_t msize = 0;
+			mach_msg_id_t mid = 0;
+			mach_msg_max_trailer_t trailer;
+			mach_msg_type_number_t tsize = sizeof(trailer);
+			kern_return_t pkr;
+
+			memset(&trailer, 0, sizeof(trailer));
+			pkr = mach_port_peek(mach_task_self(), names[i], 0, &seq, &msize, &mid,
+			    (mach_msg_trailer_info_t)&trailer, &tsize);
+			say_once("hakios: %s queue %#x msgs %u qlimit %u mscount %u seqno %u "
+			    "first %#x size %u peek %d\n", who, names[i],
+			    (unsigned)status.mps_msgcount, (unsigned)status.mps_qlimit,
+			    (unsigned)status.mps_mscount, (unsigned)status.mps_seqno,
+			    (unsigned)mid, (unsigned)msize, pkr);
+		}
+		{
+			mach_port_type_t qtype = 0;
+
+			mach_port_type(mach_task_self(), names[i], &qtype);
+			say_once("hakios: %s port %#x type %#x flags %#x srights %u sorights %u pd %u ns %u\n",
+			    who, names[i], (unsigned)qtype, (unsigned)status.mps_flags,
+			    (unsigned)status.mps_srights, (unsigned)status.mps_sorights,
+			    (unsigned)status.mps_pdrequest, (unsigned)status.mps_nsrequest);
+		}
+		watch_probe_port(who, names[i]);
+		watch_portset_membership(who, names[i], names, types, count);
+	}
+	if (bbd_service_port != 0) {
+		mach_port_status_t ss;
+		mach_msg_type_number_t sc = MACH_PORT_RECEIVE_STATUS_COUNT;
+
+		if (mach_port_get_attributes(mach_task_self(), bbd_service_port,
+		    MACH_PORT_RECEIVE_STATUS, (mach_port_info_t)&ss, &sc) == KERN_SUCCESS) {
+			say_once("hakios: %s svc %#x msgs %u qlimit %u mscount %u seqno %u t=%.1f\n",
+			    who, bbd_service_port, (unsigned)ss.mps_msgcount,
+			    (unsigned)ss.mps_qlimit, (unsigned)ss.mps_mscount,
+			    (unsigned)ss.mps_seqno, watch_since_boot());
+		} else {
+			say_once("hakios: %s svc %#x: no receive right here any more\n", who,
+			    bbd_service_port);
+		}
+	}
+	say_once("hakios: %s ports %u receive %u queued %u t=%.1f\n", who, (unsigned)count,
+	    receive, queued, watch_since_boot());
+	vm_deallocate(mach_task_self(), (vm_address_t)names, count * sizeof(mach_port_name_t));
+	if (types != NULL) {
+		vm_deallocate(mach_task_self(), (vm_address_t)types, count * sizeof(mach_port_type_t));
+	}
+}
+
+static void *
+watch_main_thread(__unused void *argument)
+{
+	struct watch *w = argument;
+	uintptr_t last_pc = 0;
+
+	for (unsigned i = 0; i < 300; i++) {
+		watch_thread_state64_t state;
+		mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+		uintptr_t pc, lr, sp, fp;
+
+		usleep(1000 * 1000);
+		if (thread_get_state(w->thread, ARM_THREAD_STATE64, (thread_state_t)&state,
+		    &count) != KERN_SUCCESS) {
+			int alive = watch_thread_alive(w);
+
+			say_once("hakios: %s main thread: thread_get_state failed at sample %u, tid %#llx %s\n",
+			    w->who, i, (unsigned long long)w->tid,
+			    alive > 0 ? "still in the task (stale name)" :
+			    alive == 0 ? "gone from the task" : "task_threads failed");
+			if (alive == 0) {
+				break;
+			}
+			continue;
+		}
+		pc = (uintptr_t)state.pc;
+		lr = (uintptr_t)state.lr;
+		sp = (uintptr_t)state.sp;
+		fp = (uintptr_t)state.fp;
+		say_once("hakios: %s t=%.1f sample %u pc %#lx lr %#lx sp %#lx fp %#lx "
+		    "x0 %#llx x1 %#llx x2 %#llx x3 %#llx x4 %#llx x5 %#llx x6 %#llx x7 %#llx mainq %u\n",
+		    w->who, watch_since_boot(), i, pc, lr, sp, fp,
+		    (unsigned long long)state.x[0], (unsigned long long)state.x[1],
+		    (unsigned long long)state.x[2], (unsigned long long)state.x[3],
+		    (unsigned long long)state.x[4], (unsigned long long)state.x[5],
+		    (unsigned long long)state.x[6], (unsigned long long)state.x[7], *w->beats);
+		if (pc != last_pc) {
+			watch_say_pc(w->who, "pc", pc);
+			watch_say_pc(w->who, "lr", lr);
+		}
+		if ((i % 10) == 0) {
+			watch_say_chain(w->who, fp);
+		}
+		if (w->dump_every != 0 && i > 0 && (i % w->dump_every) == 0) {
+			watch_dump_threads(w->who);
+		}
+		if (w->scan_every != 0 && i > 0 && (i % w->scan_every) == 0) {
+			watch_scan_ports(w->who);
+		}
+		if (pc - slide == WATCH_TRAP_MACH_MSG2 && (state.x[1] & 1) && w->dumps < 3 &&
+		    (i % 5) == 0) {
+			w->dumps++;
+			watch_dump_msg(w->who, &state);
+			watch_dump_threads(w->who);
+		}
+		if ((i & 1) == 0) {
+			dispatch_async(dispatch_get_main_queue(), ^{
+				(*w->beats)++;
+				say_once("hakios: %s mainq serviced t=%.1f beats=%u\n", w->who,
+				    watch_since_boot(), *w->beats);
+			});
+		}
+		last_pc = pc;
+	}
+	return NULL;
+}
+
+static void
+watch_start(struct watch *w)
+{
+	pthread_t thread;
+	thread_identifier_info_data_t id;
+	mach_msg_type_number_t id_count = THREAD_IDENTIFIER_INFO_COUNT;
+
+	w->thread = pthread_mach_thread_np(pthread_self());
+	/* keep the name alive: task_threads returns and deallocates its own send rights */
+	if (w->thread != MACH_PORT_NULL) {
+		mach_port_mod_refs(mach_task_self(), w->thread, MACH_PORT_RIGHT_SEND, 1);
+	}
+	memset(&id, 0, sizeof(id));
+	thread_info(w->thread, THREAD_IDENTIFIER_INFO, (thread_info_t)&id, &id_count);
+	w->tid = id.thread_id;
+	say_once("hakios: %s main thread: sampler from %s (main=%d) port %#x tid %#llx\n", w->who,
+	    pthread_main_np() ? "the main thread" : "NOT the main thread", (int)pthread_main_np(),
+	    w->thread, (unsigned long long)id.thread_id);
+	if (pthread_create(&thread, NULL, watch_main_thread, w) == 0) {
+		pthread_detach(thread);
+	}
+}
+
 __attribute__((constructor))
 static void
 hakios_init(void)
@@ -3160,22 +5308,38 @@ hakios_init(void)
 	}
 	slide = (uintptr_t)cache - CACHE_BASE;
 	if (strcmp(name, "backboardd") == 0) {
-		setenv("CA_DISABLE_GPU", "1", 1);
-		setenv("CA_FORCE_SW_RENDERER", "1", 1);
+		pthread_t probe;
+
+		watch_start(&bbd_watch);
+		if (pthread_create(&probe, NULL, watch_service_probe, NULL) == 0) {
+			pthread_detach(probe);
+		}
+		/* fix66: the CA_DISABLE_GPU / CA_FORCE_SW_RENDERER setenvs are gone -- redwood's original
+		 * never set them, QuartzCore falls back to its software renderer on its own when no GPU
+		 * service matches, and the my_renderer vtable hook still forces the software path from
+		 * the other side. */
 
 		char arguments[1024] = "";
 		size_t size = sizeof(arguments) - 1;
 
+		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+			arguments[0] = '\0';
+		}
+		hakios_ca_prod = strstr(arguments, "ca_prod=1") != NULL;
+
 		/*
-		 * CA_FORCE_TIMER=0 (fix50 tried 1: the window server never reached "StartWindowServer"
-		 * at all and the board reset, so QuartzCore really does wait for a hardware VSync it
-		 * cannot get here).  With 0 the window server comes up and finishes its start, but it
-		 * never asks for refresh notifications either (no registerNotificationPort), and it never
-		 * commits a frame: no surface is ever allocated (fix49).  So the frame clock is not what
-		 * is holding the first frame back; something before it is.  See unfreeze_window_server().
+		 * Boot-arg ca_vbl=1 (fix73, taken from upstream HakiOS): CoreAnimation's frame clock from
+		 * the display driver's refresh notifications. QuartzCore takes them
+		 * (IOMobileFramebufferEnableVSyncNotifications) only on the phones with an A7 to A10, or
+		 * when CA_FORCE_TIMER is in the environment (CADeviceUseVBL()); on the iPhone X it runs a
+		 * timer of its own instead (CADisplayTimer), whose phase it would set from the frame
+		 * timings of a display driver this one is not.  fix50's negative verdict was measured
+		 * while the unfreeze thread was still killing every backboardd generation -- never valid.
 		 */
-		setenv("CA_FORCE_TIMER", "0", 1);
-		say("hakios: CA_FORCE_TIMER=0 set: CoreAnimation CADisplayTimer runs autonomously\n");
+		if (strstr(arguments, "ca_vbl=1") != NULL) {
+			setenv("CA_FORCE_TIMER", "1", 1);
+			say("hakios: ca_vbl=1: CoreAnimation is to take the display driver's refresh notifications\n");
+		}
 		/*
 		 * Boot-arg caenv=NAME=VALUE (as many as wanted): into the window server's environment, for
 		 * CoreAnimation's own switches (CA_LOG_TRIPLE_BUFFERING=1, CA_FORCE_DOUBLE_BUFFERING=1 ...).
@@ -3200,7 +5364,12 @@ hakios_init(void)
 		window_server_fixes();
 		watch_for_faults();
 		cawindowserver_trace_fixes();
-		{ pthread_t t; pthread_create(&t, NULL, unfreeze_window_server, NULL); }
+		/* fix65: unfreeze_window_server is switched off.  fix49 proved the freeze option
+		 * was never the gate: backboardd cleared it itself four seconds later ("[RenderOverlay]
+		 * Enabling framebuffer changes on display (1)").  The thread only killed the window
+		 * server, through _dyld_get_shared_cache_range(NULL) inside hakios_cache_mappings.
+		 * The display gates (blanked / disablesUpdates / disabled) are handled where they
+		 * are set: hooked_serverWithOptions. */
 		{
 			struct stat rainy;
 
@@ -3211,11 +5380,20 @@ hakios_init(void)
 				pthread_create(&t, NULL, rain_later, NULL);
 			}
 		}
-		hakios_install_cacontext_swap_trigger();
+		/* fix66: hakios_install_cacontext_swap_trigger() is off: it forced
+		 * definesDisplayBounds=YES into every CAContext (scene ownership weirdness) and its
+		 * CA_DISABLE_GPU setenvs went with it. */
 		hakios_install_brightness_and_display_fixes();
 		hid_system_fixes();
 		input_start();
 	} else if (strncmp(name, "containermanagerd", 17) == 0) {
 		container_manager_fixes();
+	} else if (strcmp(name, "logd") == 0) {
+		watch_start(&logd_watch);
+	} else if (strcmp(name, "runningboardd") == 0) {
+		watch_start(&rbd_watch);
+	} else if (strcmp(name, "lsd") == 0) {
+		say("hakios: lsd injected (pid=%d)\n", getpid());
+		watch_start(&lsd_watch);
 	}
 }

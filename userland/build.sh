@@ -127,7 +127,7 @@ SILEO_BIN="chmod cp mkdir mv rm"
 # (libhakios.tweaks is the tweak loader of the package manager's prefix, src/inject_tweaks.c: in
 # SpringBoard the library above opens it, here it is named for the programs that have no library of
 # ours -- Settings, where a tweak's own pane belongs. Add a program's name to have tweaks in it.)
-INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd containermanagerd_system
+INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd containermanagerd_system runningboardd lsd
 /redwood/lib/libhakios.sb.dylib SpringBoard
 /redwood/lib/libhakios.media.dylib mediaserverd
 /redwood/lib/libhakios.app.dylib Sileo
@@ -241,7 +241,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			{ ${LDID:-ldid} -Ssrc/wifipw_test.entitlements obj/wifipw_test 2>/dev/null ||
 			  echo "build.sh: no ldid: wifipw_test is unsigned, and the keychain will refuse it (-34018)"; }
 		# our library for inside stock iOS programs (the jobs in INJECT are started with it)
-		$DYN -dynamiclib -install_name /redwood/lib/libhakios.dylib -framework CoreFoundation -framework CoreGraphics -framework IOKit -lobjc \
+		$DYN -dynamiclib -install_name /redwood/lib/libhakios.dylib -framework CoreFoundation -framework CoreGraphics -framework IOKit -framework IOSurface -lobjc \
 			-F${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks -framework CoreAccessories \
 			-o obj/libhakios.dylib src/inject.c
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.sb.dylib -framework CoreFoundation -framework IOKit -lobjc \

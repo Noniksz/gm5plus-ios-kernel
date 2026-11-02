@@ -36,9 +36,18 @@
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
+#include <stdint.h>
 #include <fcntl.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/mach_port.h>
+#include <mach/mach_traps.h>
+#include <mach/semaphore.h>
+#include <mach_debug/mach_debug_types.h>
+#include <mach-o/dyld.h>
+#include <mach/arm/thread_status.h>
 #include <notify.h>
+#include <pthread.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <stdarg.h>
@@ -124,13 +133,583 @@ watch_main_loop(void)
 	}
 }
 
+/* ---- where SpringBoard's main thread is, when it is not turning its run loop -------------------- */
+
+/*
+ * touch_lat=1's +1 s block (the constructor, below) never ran in fix100/101/102: no "battery: SOC="
+ * line and not one "tl:" line.  fix102's sampler put the main thread in a mach_msg send (os_log to
+ * logd) early and in SpringBoard code around what looked like 90 s -- but its lines had no clock,
+ * and the serial log interleaves an older boot, so that time was a guess.  This one says it: every
+ * sample says the seconds since boot, every fifth (and every change of pc) walks the stack for
+ * return addresses, and every two seconds a block says when the main queue serviced it.  Nothing is
+ * suspended: thread_get_state on a running thread is what inject_fairplay.c's sampler uses.
+ */
+#define WATCH_SAMPLES 6000                  /* 1 Hz: the process started at 168 s in fix104 */
+static mach_port_t sb_main_thread;
+static uintptr_t slide;                    /* the shared cache's, for unslid addresses in the log */
+static volatile unsigned mainq_beats;      /* main-queue blocks that have run */
+
+/* thread_get_state writes the raw arm64 state; the SDK's struct is opaque, this is not. */
+typedef struct {
+	uint64_t x[29];
+	uint64_t fp;
+	uint64_t lr;
+	uint64_t sp;
+	uint64_t pc;
+	uint32_t cpsr;
+	uint32_t flags;
+} sb_thread_state64_t;
+
+/* Seconds since boot, the clock the kernel's "[HB] heartbeat N, M s since start" counts in. */
+static double
+since_boot(void)
+{
+	mach_timebase_info_data_t tb;
+
+	mach_timebase_info(&tb);
+	return (double)mach_absolute_time() * (double)tb.numer / (double)tb.denom / 1e9;
+}
+
+/* A second way out of the process, for the case where stderr (say's fd 2) has been closed on us. */
+static void
+say_console(const char *line)
+{
+	int fd = open("/dev/console", O_WRONLY | O_NOCTTY);
+
+	if (fd >= 0) {
+		write(fd, line, strlen(line));
+		close(fd);
+	}
+}
+
+static void
+say_pc(const char *what, uintptr_t pc)
+{
+	Dl_info info;
+	const char *name = "?";
+	uintptr_t base = 0;
+
+	if (pc != 0 && dladdr((void *)pc, &info) != 0) {
+		const char *slash = strrchr(info.dli_fname, '/');
+
+		name = slash ? slash + 1 : info.dli_fname;
+		base = (uintptr_t)info.dli_fbase;
+	}
+	say("hakios: sb %.1f %s %#lx = %s+%#lx (cache %#lx)\n", since_boot(), what, pc, name, pc - base, pc - slide);
+}
+
+/*
+ * The frame-pointer chain is not enough on arm64e (a leaf frame and a stub have no chain).  The
+ * stack itself is: walk a kilobyte of it for words that dyld resolves to an image, drop the
+ * arm64e signature bits, and say each distinct one once.  This is a reading of a running thread's
+ * stack, so a line can be torn; the same address in two samples is the signal.
+ */
+static void
+say_stack(uintptr_t sp)
+{
+	uintptr_t words[128];
+	uintptr_t seen[12];
+	vm_size_t got = 0;
+	unsigned shown = 0;
+
+	sp &= ~(uintptr_t)0xf;
+	if (vm_read_overwrite(mach_task_self(), (vm_address_t)sp, sizeof(words), (vm_address_t)words,
+	    &got) != KERN_SUCCESS) {
+		return;
+	}
+	for (unsigned i = 0; i < got / sizeof(uintptr_t) && shown < 12; i++) {
+		uintptr_t v = words[i] & 0x0000000fffffffffUL;
+		Dl_info info;
+		bool dup = false;
+
+		if (v < 0x100000000UL || dladdr((void *)v, &info) == 0 || info.dli_fbase == NULL) {
+			continue;
+		}
+		for (unsigned j = 0; j < shown; j++) {
+			dup |= seen[j] == v;
+		}
+		if (dup) {
+			continue;
+		}
+		seen[shown++] = v;
+		say_pc("stack", v);
+	}
+}
+
+/*
+ * fix107: the frame-pointer chain, frame by frame -- [fp] is the caller's fp, [fp + 8] the
+ * return address.  The stack scan above drowns the call path in stale words; the chain is the
+ * one reading that says which function called into BackBoardServices, and through which.
+ */
+static void
+say_chain(uintptr_t fp)
+{
+	for (unsigned frame = 0; frame < 12 && fp >= 0x100000000UL && (fp & 7) == 0; frame++) {
+		uintptr_t pair[2];
+		vm_size_t got = 0;
+
+		if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, sizeof(pair), (vm_address_t)pair,
+		    &got) != KERN_SUCCESS || got < sizeof(pair)) {
+			break;
+		}
+		if (pair[1] != 0) {
+			say_pc("chain", pair[1] & 0x0000000fffffffffUL);
+		}
+		if (pair[0] <= fp) {
+			break;
+		}
+		fp = pair[0];
+	}
+}
+
+/*
+ * fix107: the call SpringBoard's main thread waits on is BackBoardServices' synchronous MIG call
+ * to "com.apple.backboard.display.services" (msgh_id 0x5b9171, 24 bytes, no arguments).  Its peer
+ * is the display-services server inside backboardd, whose own log stops at t ~ 60 s.  Ask the same
+ * question ourselves at two times: look the name up in launchd's namespace, send the same
+ * 24-byte request with a two-second send timeout, then wait two seconds for the reply.  A server
+ * that does not take the message, or takes it and never answers, is the stall itself, seen from
+ * outside; an answer before SpringBoard blocks and none after says when it went away.
+ */
+extern kern_return_t bootstrap_look_up(mach_port_t bootstrap, const char *service_name,
+    mach_port_t *service_port);
+extern mach_port_t mach_reply_port(void);
+
+static void
+probe_display_services(void)
+{
+	static const char service[] = "com.apple.backboard.display.services";
+	mach_port_t bootstrap = MACH_PORT_NULL, server = MACH_PORT_NULL;
+	mach_port_t reply = MACH_PORT_NULL;
+	kern_return_t kr;
+	char request[24];
+
+	task_get_bootstrap_port(mach_task_self(), &bootstrap);
+	kr = bootstrap_look_up(bootstrap, service, &server);
+	say("hakios: sb probe t=%.1f look up \"%s\": kr %d port %#x\n", since_boot(), service, kr, server);
+	if (kr != KERN_SUCCESS) {
+		return;
+	}
+	/*
+	 * fix112 step 1: send with no reply port at all.  The kernel only walks the reply-port
+	 * check when msgh_local_port is valid, so this send cannot trip kGUARD_EXC_SEND_INVALID_REPLY
+	 * whatever state the reply right is in.  Its return value alone says whether the endpoint
+	 * launchd hands out for this service accepts ordinary sends.
+	 */
+	memset(request, 0, sizeof(request));
+	*(uint32_t *)(request + 0) = 0x00000013;       /* COPY_SEND to the server, no local port */
+	*(uint32_t *)(request + 4) = sizeof(request);
+	*(uint32_t *)(request + 8) = server;
+	*(uint32_t *)(request + 20) = 0x5b9171;
+	say("hakios: sb probe t=%.1f ff send id 0x5b9171 to %#x\n", since_boot(), server);
+	kr = mach_msg((mach_msg_header_t *)request, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(request), 0,
+	    MACH_PORT_NULL, 80, MACH_PORT_NULL);
+	say("hakios: sb probe t=%.1f ff send kr %d (%s)\n", since_boot(), kr, mach_error_string(kr));
+
+	/*
+	 * fix112 step 2: an explicitly allocated receive right, with its rights read back before
+	 * the send.  If this send still dies, launchd's guard code names the port and the log says
+	 * what the kernel thought of that same name a few microseconds earlier.
+	 */
+	kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &reply);
+	{
+		mach_port_type_t type = 0;
+		mach_port_urefs_t refs = 0;
+
+		if (kr == KERN_SUCCESS) {
+			mach_port_type(mach_task_self(), reply, &type);
+			mach_port_get_refs(mach_task_self(), reply, MACH_PORT_RIGHT_RECEIVE, &refs);
+		}
+		say("hakios: sb probe t=%.1f reply %#x alloc kr %d type %#x urefs %u\n", since_boot(),
+		    reply, kr, type, refs);
+	}
+	if (kr != KERN_SUCCESS) {
+		mach_port_deallocate(mach_task_self(), server);
+		return;
+	}
+	say("hakios: sb probe t=%.1f hdr bits %#x size %u remote %#x local %#x voucher 0 id %#x\n",
+	    since_boot(), 0x1513, (unsigned)sizeof(request), server, reply, 0x5b9171);
+	memset(request, 0, sizeof(request));
+	*(uint32_t *)(request + 0) = 0x00001513;       /* COPY_SEND to the server, MAKE_SEND_ONCE reply */
+	*(uint32_t *)(request + 4) = sizeof(request);
+	*(uint32_t *)(request + 8) = server;
+	*(uint32_t *)(request + 12) = reply;
+	*(uint32_t *)(request + 20) = 0x5b9171;
+	say("hakios: sb probe t=%.1f sending id 0x5b9171 to %#x\n", since_boot(), server);
+	kr = mach_msg((mach_msg_header_t *)request, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(request), 0,
+	    MACH_PORT_NULL, 80, MACH_PORT_NULL);
+	say("hakios: sb probe t=%.1f send id 0x5b9171: kr %d (%s)\n", since_boot(), kr, mach_error_string(kr));
+	if (kr != KERN_SUCCESS) {
+		mach_port_deallocate(mach_task_self(), server);
+		mach_port_mod_refs(mach_task_self(), reply, MACH_PORT_RIGHT_RECEIVE, -1);
+		return;
+	}
+	{
+		char buffer[128];
+		mach_msg_header_t *header = (mach_msg_header_t *)buffer;
+
+		memset(buffer, 0, sizeof(buffer));
+		kr = mach_msg(header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(buffer), reply, 80,
+		    MACH_PORT_NULL);
+		if (kr == KERN_SUCCESS) {
+			say("hakios: sb probe t=%.1f reply bits %#x size %u id %#x\n", since_boot(),
+			    header->msgh_bits, header->msgh_size, header->msgh_id);
+		} else {
+			say("hakios: sb probe t=%.1f no reply: kr %d (%s)\n", since_boot(), kr,
+			    mach_error_string(kr));
+		}
+	}
+	mach_port_deallocate(mach_task_self(), server);
+	if (reply != MACH_PORT_NULL) {
+		mach_port_mod_refs(mach_task_self(), reply, MACH_PORT_RIGHT_RECEIVE, -1);
+	}
+}
+
+static void * __attribute__((unused))
+sb_probe_thread(__unused void *ignored)
+{
+	/*
+	 * fix108: relative waits, not the absolute mach clock: on a warm reboot the hardware
+	 * counter keeps running, so since_boot() is already far past 75 s when SpringBoard starts
+	 * (fix107 showed t ~ 1284 s at launch, and both probes fired at once).
+	 */
+	sleep(2);
+	probe_display_services();
+	sleep(3);
+	probe_display_services();
+	return NULL;
+}
+
+/*
+ * mach_msg2_trap's eight arguments are the whole story: options say send, receive or both;
+ * msgh_bits_and_send_size and msgh_remote_and_local_port name the ports; voucher_and_id carries
+ * the message id; desc_count_and_rcv_name the port we receive on; rcv_size_and_priority the
+ * buffer size; the last is the timeout.  For a send, the buffer at x0 holds an XPC body, whose
+ * printable runs say which service or key the call is about.  Said twice per kind.
+ */
+static void
+say_strings(const unsigned char *buf, unsigned len)
+{
+	char run[49];
+	unsigned n = 0;
+	unsigned said = 0;
+
+	for (unsigned i = 0; i <= len; i++) {
+		unsigned char c = i < len ? buf[i] : 0;
+
+		if (c >= 0x20 && c < 0x7f) {
+			if (n < sizeof(run) - 1) {
+				run[n++] = (char)c;
+			}
+			continue;
+		}
+		if (n >= 4 && said < 6) {
+			run[n] = 0;
+			say("hakios: sb msg str: %s\n", run);
+			said++;
+		}
+		n = 0;
+	}
+}
+
+static void
+dump_mach_msg(const sb_thread_state64_t *st)
+{
+	uint64_t option = st->x[1], bits_ss = st->x[2], ports = st->x[3];
+	uint64_t vou_id = st->x[4], dc_rn = st->x[5], rsize_pri = st->x[6];
+	uint32_t bits = (uint32_t)bits_ss, ssize = (uint32_t)(bits_ss >> 32);
+	uint32_t remote = (uint32_t)ports, local = (uint32_t)(ports >> 32);
+	uint32_t voucher = (uint32_t)vou_id, id = (uint32_t)(vou_id >> 32);
+	uint32_t dcount = (uint32_t)dc_rn, rname = (uint32_t)(dc_rn >> 32);
+	uint32_t rsize = (uint32_t)rsize_pri, pri = (uint32_t)(rsize_pri >> 32);
+	unsigned char buf[0x300];
+	vm_size_t got = 0;
+	unsigned want = ssize > sizeof(buf) ? sizeof(buf) : ssize;
+
+	say("hakios: sb msg2 opt %#llx bits %#x ssize %u remote %#x local %#x voucher %#x id %#x "
+	    "dcnt %u rname %#x rsize %u pri %u timeout %#llx\n", (unsigned long long)option, bits,
+	    ssize, remote, local, voucher, id, dcount, rname, rsize, pri,
+	    (unsigned long long)st->x[7]);
+	if (want == 0 || st->x[0] < 0x100000000UL ||
+	    vm_read_overwrite(mach_task_self(), (vm_address_t)st->x[0], want, (vm_address_t)buf,
+	    &got) != KERN_SUCCESS || got < 8) {
+		return;
+	}
+	say("hakios: sb msg hex %08x %08x %08x %08x %08x %08x %08x %08x\n",
+	    *(uint32_t *)(buf + 0), *(uint32_t *)(buf + 4), *(uint32_t *)(buf + 8),
+	    *(uint32_t *)(buf + 12), *(uint32_t *)(buf + 16), *(uint32_t *)(buf + 20),
+	    *(uint32_t *)(buf + 24), *(uint32_t *)(buf + 28));
+	say_strings(buf, (unsigned)got);
+}
+
+/* What kind of right a name is and whether it is the task's bootstrap port (launchd). */
+static void
+probe_port(const char *what, mach_port_t name)
+{
+	mach_port_type_t type = 0;
+	mach_port_urefs_t refs = 0;
+	mach_port_t bootstrap = MACH_PORT_NULL;
+	kern_return_t kr = mach_port_type(mach_task_self(), name, &type);
+
+	task_get_bootstrap_port(mach_task_self(), &bootstrap);
+	say("hakios: sb port %s %#x type %#x kr %d, bootstrap %#x%s\n", what, name, type, kr,
+	    bootstrap, name == bootstrap ? " THIS IS BOOTSTRAP" : "");
+	if (mach_port_get_refs(mach_task_self(), name, MACH_PORT_RIGHT_SEND, &refs) == KERN_SUCCESS) {
+		say("hakios: sb port %s %#x send refs %u\n", what, name, refs);
+	}
+	{
+		natural_t object_type = 0;
+		mach_vm_address_t object_addr = 0;
+
+		kr = mach_port_kobject(mach_task_self(), name, &object_type, &object_addr);
+		say("hakios: sb port %s %#x kobject kr %d type %#x addr %#llx\n", what, name, kr,
+		    object_type, (unsigned long long)object_addr);
+		if (kr == KERN_SUCCESS) {
+			kobject_description_t description;
+
+			memset(description, 0, sizeof(description));
+			if (mach_port_kobject_description(mach_task_self(), name, &object_type, &object_addr,
+			    description) == KERN_SUCCESS) {
+				say("hakios: sb port %s %#x kobject says \"%s\"\n", what, name, description);
+			}
+			if (object_type == 2 /* IKOT_TASK */) {
+				int pid = 0;
+
+				if (pid_for_task(name, &pid) == KERN_SUCCESS) {
+					say("hakios: sb port %s %#x is task port of pid %d\n", what, name, pid);
+				}
+			}
+		}
+	}
+}
+
+
+/*
+ * fix138: the ulock owner word is a Mach thread port name (masked with ~3), not the
+ * kernel tid.  Match task_threads() ports, mark the owner, and dump its lr/chain so a
+ * framework thread that holds a lock across a sync XPC is visible in the log.
+ */
+static void
+dump_threads(unsigned owner_word)
+{
+	thread_act_array_t threads = NULL;
+	mach_msg_type_number_t count = 0;
+	mach_port_t self_port = pthread_mach_thread_np(pthread_self());
+
+	if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
+		return;
+	}
+	say("hakios: sb threads %u, ulock word %#x, owner port guess %#x\n", (unsigned)count,
+	    owner_word, (owner_word & ~3U) | 3U);
+	for (mach_msg_type_number_t i = 0; i < count; i++) {
+		thread_identifier_info_data_t id;
+		mach_msg_type_number_t id_count = THREAD_IDENTIFIER_INFO_COUNT;
+		sb_thread_state64_t st;
+		mach_msg_type_number_t st_count = ARM_THREAD_STATE64_COUNT;
+		unsigned long long tid = 0;
+		bool is_owner = ((threads[i] & ~3U) == (owner_word & ~3U));
+		const char *mark = is_owner ? "*OWNER*" : " ";
+
+		if (thread_info(threads[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&id, &id_count) == KERN_SUCCESS) {
+			tid = (unsigned long long)id.thread_id;
+		}
+		if (thread_get_state(threads[i], ARM_THREAD_STATE64, (thread_state_t)&st, &st_count) == KERN_SUCCESS) {
+			Dl_info info;
+			const char *name = "?";
+			uintptr_t base = 0;
+
+			if (st.pc != 0 && dladdr((void *)(uintptr_t)st.pc, &info) != 0 && info.dli_fbase != NULL) {
+				const char *slash = strrchr(info.dli_fname, '/');
+
+				name = slash ? slash + 1 : info.dli_fname;
+				base = (uintptr_t)info.dli_fbase;
+			}
+			say("hakios: sb thread %u port %#x tid %#llx %s pc %#llx = %s+%#lx (cache %#lx)\n",
+			    i, threads[i], tid, mark, (unsigned long long)st.pc, name,
+			    (uintptr_t)st.pc - base, (uintptr_t)st.pc - slide);
+			if (threads[i] != self_port && (is_owner || ((uintptr_t)st.pc - slide == 0x1c1852ff0UL && i > 0))) {
+				say_pc("owner-lr", (uintptr_t)st.lr);
+				say_chain((uintptr_t)st.fp);
+				if ((uintptr_t)st.pc - slide == 0x1c1852ff0UL) {
+					dump_mach_msg(&st);
+					probe_port("owner-rname", (mach_port_t)(st.x[5] >> 32));
+					probe_port("owner-remote", (mach_port_t)(uint32_t)st.x[3]);
+				}
+			}
+		}
+		mach_port_deallocate(mach_task_self(), threads[i]);
+	}
+	vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_t));
+}
+
+extern kern_return_t mach_msg_send(mach_msg_header_t *msg);
+
+static void
+sb_wake_reply(uint32_t id, mach_port_t rname)
+{
+	struct {
+		mach_msg_header_t h;
+		uint32_t ndr;
+		int32_t retcode;
+	} r;
+
+	if (rname == MACH_PORT_NULL || rname == MACH_PORT_DEAD) {
+		return;
+	}
+	memset(&r, 0, sizeof r);
+	r.h.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND, 0);
+	r.h.msgh_size = sizeof r; /* 32: header + NDR + RetCode */
+	r.h.msgh_remote_port = rname;
+	r.h.msgh_local_port = MACH_PORT_NULL;
+	r.h.msgh_voucher_port = MACH_PORT_NULL;
+	r.h.msgh_id = (mach_msg_id_t)id;
+	r.ndr = 0;
+	r.retcode = (int32_t)0x10000003; /* MIG_BAD_ARGUMENTS: clean error, no out-param parse */
+	mach_port_insert_right(mach_task_self(), rname, rname, MACH_MSG_TYPE_MAKE_SEND);
+	say("hakios: sb wake: sending err-reply id %#x -> rname %#x\n", id, rname);
+	kern_return_t kr = mach_msg_send(&r.h);
+	say("hakios: sb wake: sent id %#x rname %#x kr=%d\n", id, rname, kr);
+}
+
+static void *
+sb_main_watchdog(__unused void *ignored)
+{
+	uintptr_t last_pc = 0;
+	unsigned dumps = 0;
+	unsigned lock_dumps = 0;
+
+	for (unsigned i = 0; i < WATCH_SAMPLES; i++) {
+		sb_thread_state64_t state;
+		mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+		uintptr_t pc, lr, sp, fp;
+
+		usleep(100 * 1000);
+		if (thread_get_state(sb_main_thread, ARM_THREAD_STATE64, (thread_state_t)&state, &count) != KERN_SUCCESS) {
+			say("hakios: sb main thread: thread_get_state failed at sample %u\n", i);
+			break;
+		}
+		pc = (uintptr_t)state.pc;
+		lr = (uintptr_t)state.lr;
+		sp = (uintptr_t)state.sp;
+		fp = (uintptr_t)state.fp;
+		say("hakios: sb t=%.1f sample %u pc %#lx lr %#lx sp %#lx fp %#lx "
+		    "x0 %#llx x1 %#llx x2 %#llx x3 %#llx x4 %#llx x5 %#llx x6 %#llx x7 %#llx mainq %u\n",
+		    since_boot(), i, pc, lr, sp, fp,
+		    (unsigned long long)state.x[0], (unsigned long long)state.x[1],
+		    (unsigned long long)state.x[2], (unsigned long long)state.x[3],
+		    (unsigned long long)state.x[4], (unsigned long long)state.x[5],
+		    (unsigned long long)state.x[6], (unsigned long long)state.x[7], mainq_beats);
+		{
+			uint64_t opt = state.x[1];
+			bool snd = (opt & 1) != 0, rcv = (opt & 2) != 0;
+			if (snd && rcv) {
+				say("hakios: wdbg i=%u bid=%#x rn=%#x\n", i,
+				    (unsigned)(state.x[4] >> 32), (unsigned)(state.x[5] >> 32));
+				uint32_t bid = (uint32_t)(state.x[4] >> 32);
+				mach_port_t rname = (mach_port_t)(state.x[5] >> 32);
+				{
+					static unsigned woke;
+					if (woke < 400 && rname != MACH_PORT_NULL && rname != MACH_PORT_DEAD) {
+						woke++;
+						sb_wake_reply(bid, rname);
+					}
+				}
+			}
+		}
+		if (i == 0) {
+			say_console("hakios: sb watchdog console write works\n");
+		}
+		if (pc != last_pc || i % 5 == 0) {
+			say_pc("pc", pc);
+			say_pc("lr", lr);
+			say_stack(sp);
+		}
+		if ((pc - slide == 0x1c1852ff0UL || (i % 10) == 0)) {
+			say_chain(fp);
+		}
+		if (pc - slide == 0x1c1852ff0UL) {
+			uint64_t opt = state.x[1];
+			bool send = (opt & 1) != 0;
+			bool recv = (opt & 2) != 0;
+
+
+			if (send && dumps < 2 && (i % 5) == 0) {
+				dumps++;
+				dump_mach_msg(&state);
+			}
+			if (!send && recv && dumps < 3 && (i % 10) == 0) {
+				dumps++;
+				say("hakios: sb receive t=%.1f sample %u: waiting for a reply\n",
+				    since_boot(), i);
+				dump_mach_msg(&state);
+				probe_port("rname", (mach_port_t)(state.x[5] >> 32));
+				probe_port("remote", (mach_port_t)(uint32_t)state.x[3]);
+				probe_port("local", (mach_port_t)(uint32_t)(state.x[3] >> 32));
+			}
+		}
+		if (lock_dumps < 2 && pc - slide == 0x1c1853a90UL && (i % 10) == 0) {
+			uint32_t word = 0;
+			vm_size_t got = 0;
+
+			lock_dumps++;
+			say("hakios: sb ulock op %#llx addr %#llx value %#llx timeout %#llx\n",
+			    (unsigned long long)state.x[0], (unsigned long long)state.x[1],
+			    (unsigned long long)state.x[2], (unsigned long long)state.x[3]);
+			if (vm_read_overwrite(mach_task_self(), (vm_address_t)state.x[1], sizeof(word),
+			    (vm_address_t)&word, &got) == KERN_SUCCESS) {
+				say("hakios: sb ulock word now %#x\n", word);
+			}
+			dump_threads((unsigned)state.x[2]);
+		}
+		if ((i & 1) == 0) {
+			dispatch_async(dispatch_get_main_queue(), ^{
+				mainq_beats++;
+				say("hakios: sb mainq serviced t=%.1f beats=%u\n", since_boot(), mainq_beats);
+			});
+		}
+		last_pc = pc;
+	}
+	return NULL;
+}
+
+static void
+watch_main_thread(void)
+{
+	pthread_t thread;
+	thread_identifier_info_data_t id;
+	mach_msg_type_number_t id_count = THREAD_IDENTIFIER_INFO_COUNT;
+	mach_port_t bootstrap = MACH_PORT_NULL;
+
+	sb_main_thread = pthread_mach_thread_np(pthread_self());
+	memset(&id, 0, sizeof(id));
+	thread_info(sb_main_thread, THREAD_IDENTIFIER_INFO, (thread_info_t)&id, &id_count);
+	task_get_bootstrap_port(mach_task_self(), &bootstrap);
+	say("hakios: sb main thread: watchdog from %s (main=%d) port %#x tid %#llx bootstrap %#x\n",
+	    pthread_main_np() ? "the main thread" : "NOT the main thread", (int)pthread_main_np(),
+	    sb_main_thread, (unsigned long long)id.thread_id, bootstrap);
+	{
+		const char *image = _dyld_get_image_name(0);
+
+		say("hakios: sb image 0 %s slide %#lx, shared cache slide %#lx\n", image ? image : "?",
+		    (uintptr_t)_dyld_get_image_vmaddr_slide(0), slide);
+	}
+	if (pthread_create(&thread, NULL, sb_main_watchdog, NULL) == 0) {
+		pthread_detach(thread);
+	}
+	/*
+	 * fix113: the display-services probe is gone from SpringBoard.  fix112 showed that every
+	 * reply-carrying send dies with kGUARD_EXC_SEND_INVALID_REPLY naming the reply port, and
+	 * launchd then kills SpringBoard -- thirteen spawns, twelve guards, not one line of data.
+	 * backboardd runs the same probe now (src/inject.c, watch_service_probe) and restarts
+	 * harmlessly, so the window server and the UI stay up while the call shape is worked out.
+	 */
+}
+
 /* ---- methods of SpringBoard's classes, replaced --------------------------------------------------- */
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
 
 #define CACHE_BASE 0x180000000UL                /* where the cache was built to be, before the slide */
-
-static uintptr_t slide;
 
 /*
  * Replace -[CLASS SELECTOR] (or +[CLASS SELECTOR]: `kind` is that first character), whose code must now
@@ -1071,6 +1650,117 @@ layers(void)
 }
 
 /*
+ * fix160: trace the CoreAnimation contexts SpringBoard asks for.  The window server reaches
+ * its display, but no CA update ever arrives; the question is whether SpringBoard creates a
+ * remote context at all, and what options (display id, definesDisplayBounds) it passes.
+ */
+static IMP sb_orig_cacontext_local_opts;
+static IMP sb_orig_cacontext_remote_opts;
+
+static void
+sb_say_cacontext_options(const char *what, CFDictionaryRef options)
+{
+	char text[900] = "nil";
+
+	if (options != NULL) {
+		CFStringRef d = CFCopyDescription(options);
+
+		if (d != NULL) {
+			CFStringGetCString(d, text, sizeof(text), kCFStringEncodingUTF8);
+			CFRelease(d);
+		}
+	}
+	say("hakios: SB CAContext %s options: %s\n", what, text);
+}
+
+static void
+sb_say_cacontext_result(id ctx)
+{
+	unsigned context_id = 0, display_id = 0;
+	Class cls;
+
+	if (ctx == nil) {
+		say("hakios: SB CAContext -> nil\n");
+		return;
+	}
+	cls = object_getClass(ctx);
+	if (class_getInstanceMethod(cls, sel_registerName("contextId")) != NULL) {
+		context_id = SEND(unsigned, ctx, "contextId");
+	}
+	if (class_getInstanceMethod(cls, sel_registerName("displayId")) != NULL) {
+		display_id = SEND(unsigned, ctx, "displayId");
+	}
+	say("hakios: SB CAContext -> %p contextId=%u displayId=%u\n", (void *) ctx, context_id, display_id);
+}
+
+static id
+sb_cacontext_local_opts(id self, SEL _cmd, CFDictionaryRef options)
+{
+	id ctx;
+
+	sb_say_cacontext_options("localContextWithOptions:", options);
+	ctx = ((id (*)(id, SEL, CFDictionaryRef)) sb_orig_cacontext_local_opts)(self, _cmd, options);
+	sb_say_cacontext_result(ctx);
+	return ctx;
+}
+
+static id
+sb_cacontext_remote_opts(id self, SEL _cmd, CFDictionaryRef options)
+{
+	CFMutableDictionaryRef patched = NULL;
+	id ctx;
+
+	sb_say_cacontext_options("remoteContextWithOptions:", options);
+	if (options != NULL) {
+		patched = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, options);
+	}
+	if (patched == NULL) {
+		patched = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
+		    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	}
+	if (patched != NULL) {
+		int one = 1;
+		CFNumberRef n = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &one);
+
+		if (n != NULL) {
+			CFDictionarySetValue(patched, CFSTR("kCAContextDisplayId"), n);
+			CFRelease(n);
+		}
+		CFDictionarySetValue(patched, CFSTR("secure"), kCFBooleanFalse);
+		say("hakios: SB CAContext remote options + kCAContextDisplayId=1, secure=0\n");
+	}
+	ctx = ((id (*)(id, SEL, CFDictionaryRef)) sb_orig_cacontext_remote_opts)(self, _cmd,
+	    patched != NULL ? patched : options);
+	if (patched != NULL) {
+		CFRelease(patched);
+	}
+	sb_say_cacontext_result(ctx);
+	return ctx;
+}
+
+static void
+sb_install_cacontext_trace(void)
+{
+	Class cls = objc_getClass("CAContext");
+	Method m;
+
+	if (cls == NULL) {
+		say("hakios: SB CAContext class not found\n");
+		return;
+	}
+	m = class_getClassMethod(cls, sel_registerName("localContextWithOptions:"));
+	if (m != NULL) {
+		sb_orig_cacontext_local_opts = method_setImplementation(m, (IMP) sb_cacontext_local_opts);
+	}
+	m = class_getClassMethod(cls, sel_registerName("remoteContextWithOptions:"));
+	if (m != NULL) {
+		sb_orig_cacontext_remote_opts = method_setImplementation(m, (IMP) sb_cacontext_remote_opts);
+	}
+	say("hakios: SB CAContext trace installed (local=%d remote=%d)\n",
+	    sb_orig_cacontext_local_opts != NULL, sb_orig_cacontext_remote_opts != NULL);
+}
+
+/*
  * The switcher of running applications, on the notification com.hakios.switcher (rwtouch notify).
  * A drag up from the bottom edge is the way to it on a phone, but the touches a script puts in do
  * not reach iOS's system gestures -- nothing comes of such a drag, not even going home -- and two
@@ -1220,6 +1910,725 @@ load_tweaks(void)
 	}
 }
 
+/* ============================================================================
+ * fix117: what SpringBoard asks for.
+ *
+ * The display stack is not what keeps the panel dark.  backboardd registers its vsync port
+ * (selector 72), the driver sends every refresh, and no swap is asked for because there is
+ * nothing to show -- and what does show is SpringBoard sitting in mach_msg since t ~ 59 s with
+ * one line to its name, a failed lookup of com.apple.chronoservices.  So name every service it
+ * asks bootstrap for and every mach service it opens an XPC connection to, with the answer it
+ * got.  The last ones before it goes quiet are the question the next round answers.
+ * ============================================================================ */
+
+/* this SDK has no xpc headers; the one call and its type are all the interposition needs */
+typedef struct _xpc_object_s *xpc_object_t;
+typedef struct _xpc_type_s *xpc_type_t;    /* fix125: xpc_get_type's answer, opaque */
+typedef struct _xpc_connection_s *xpc_connection_t;
+typedef void (^sb_xpc_handler_t)(xpc_object_t);
+
+extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp);
+extern kern_return_t bootstrap_look_up2(mach_port_t bp, const char *service_name, mach_port_t *sp,
+    int target_pid, uint64_t flags, uint8_t type);
+extern xpc_object_t xpc_connection_create_mach_service(const char *name, dispatch_queue_t targetq,
+    uint64_t flags);
+extern xpc_object_t xpc_connection_send_message_with_reply_sync(xpc_connection_t connection,
+    xpc_object_t message);
+extern void xpc_connection_send_message(xpc_connection_t connection, xpc_object_t message);
+extern void xpc_connection_set_event_handler(xpc_connection_t connection, sb_xpc_handler_t handler);
+extern void xpc_connection_send_message_with_reply(xpc_connection_t connection,
+    xpc_object_t message, dispatch_queue_t queue, sb_xpc_handler_t handler);
+extern const char *xpc_connection_get_name(xpc_connection_t connection);
+extern xpc_object_t xpc_dictionary_create(const char * const *keys, xpc_object_t *values,
+    size_t count);
+extern const char *xpc_dictionary_get_string(xpc_object_t xdict, const char *key);
+extern xpc_object_t xpc_dictionary_get_value(xpc_object_t xdict, const char *key);
+extern const void *xpc_data_get_bytes_ptr(xpc_object_t xdata);
+extern size_t xpc_data_get_length(xpc_object_t xdata);
+extern void xpc_dictionary_set_string(xpc_object_t xdict, const char *key, const char *string);
+extern void xpc_dictionary_set_value(xpc_object_t xdict, const char *key, xpc_object_t value);
+extern xpc_object_t xpc_retain(xpc_object_t object);
+extern void xpc_release(xpc_object_t object);
+extern xpc_object_t xpc_data_create(const void *bytes, size_t length);
+extern const char *xpc_type_get_name(xpc_type_t type);
+extern xpc_type_t xpc_get_type(xpc_object_t object);
+extern char *xpc_copy_description(xpc_object_t object);
+
+static void sb_xpc_say_object(const char *what, const char *name, xpc_object_t object);
+
+/* a name is worth saying three times: the twelfth repeat of it says nothing new */
+static bool
+sb_worth_saying(const char *name)
+{
+	static struct {
+		const char *name;
+		unsigned n;
+	} seen[128];
+	static unsigned count;
+
+	for (unsigned i = 0; i < count; i++) {
+		if (strcmp(seen[i].name, name) == 0) {
+			return ++seen[i].n <= 3;
+		}
+	}
+	if (count < 128 && (seen[count].name = strdup(name)) != NULL) {
+		seen[count].n = 1;
+		count++;
+		return true;
+	}
+	return false;
+}
+
+/* fix136: __DATA,__interpose icindeki fonksiyonlarda ASLA dlsym(RTLD_NEXT, ...) kullanma!
+ * dyld4 interpose edilen sembol icin dlsym(RTLD_NEXT) cagrildiginda yine bizim interposer'i
+ * dondurup sonsuz ozyineleme (SIGBUS stack overflow) yaratiyor. Orijinal extern fonksiyonu
+ * dogrudan cagirmak dyld tarafindan interpose edilmez ve dogrudan libxpc'ye gider. */
+__attribute__((used)) static kern_return_t
+sb_bootstrap_look_up(mach_port_t bp, const char *name, mach_port_t *port)
+{
+	kern_return_t kr = bootstrap_look_up(bp, name, port);
+	if (name != NULL && sb_worth_saying(name)) {
+		say("hakios: sb look up \"%s\" kr %d port %#x\n", name, kr,
+		    (kr == KERN_SUCCESS && port != NULL) ? *port : 0);
+	}
+	return kr;
+}
+
+__attribute__((used)) static xpc_object_t
+sb_xpc_connection_create_mach_service(const char *name, dispatch_queue_t targetq, uint64_t flags)
+{
+	if (name != NULL && sb_worth_saying(name)) {
+		say("hakios: sb xpc service \"%s\" flags %#llx\n", name, (unsigned long long) flags);
+	}
+	/* fix120: cfprefsd is not in the root image, so launchd can never start it. */
+	if (name != NULL && (strcmp(name, "com.apple.cfprefsd.daemon") == 0 ||
+	                     strcmp(name, "com.apple.cfprefsd.agent") == 0)) {
+		return (xpc_object_t)0;
+	}
+	return xpc_connection_create_mach_service(name, targetq, flags);
+}
+
+__attribute__((used)) static kern_return_t
+sb_bootstrap_look_up2(mach_port_t bp, const char *name, mach_port_t *port, int target,
+    uint64_t flags, uint8_t type)
+{
+	kern_return_t kr = bootstrap_look_up2(bp, name, port, target, flags, type);
+	if (name != NULL && sb_worth_saying(name)) {
+		say("hakios: sb look up2 \"%s\" flags %#llx type %u kr %d port %#x\n", name,
+		    (unsigned long long) flags, (unsigned) type, kr,
+		    (kr == KERN_SUCCESS && port != NULL) ? *port : 0);
+	}
+	return kr;
+}
+
+/* fix136: RBSConnection ve RBSProcessHandle sentetik yanit ureticileri (Yol B fallback) */
+static void
+sb_populate_rbs_connection_ivars(id handle)
+{
+	if (!handle) return;
+	Class rbsConnCls = objc_getClass("RBSConnection");
+	if (!rbsConnCls) return;
+	SEL sharedSel = sel_registerName("sharedInstance");
+	if (!class_respondsToSelector(object_getClass((id)rbsConnCls), sharedSel)) return;
+	id conn = ((id (*)(id, SEL))objc_msgSend)((id)rbsConnCls, sharedSel);
+	if (!conn) return;
+
+	Ivar handleIvar = class_getInstanceVariable(rbsConnCls, "_handle");
+	if (handleIvar) {
+		object_setIvar(conn, handleIvar, handle);
+	}
+	Ivar stateIvar = class_getInstanceVariable(rbsConnCls, "_state");
+	if (stateIvar) {
+		ptrdiff_t off = ivar_getOffset(stateIvar);
+		*(uint64_t *)((uintptr_t)conn + off) = 2; /* RBSConnectionStateReady */
+	}
+	say("hakios: sb fix136 populated RBSConnection(%p)->_handle=%p _state=2\n",
+	    (void *)conn, (void *)handle);
+}
+
+static id
+sb_build_rbs_process_handle(void)
+{
+	pid_t mypid = getpid();
+	Class idCls = objc_getClass("RBSProcessIdentifier");
+	Class identCls = objc_getClass("RBSProcessIdentity");
+	Class handleCls = objc_getClass("RBSProcessHandle");
+	if (!handleCls) return NULL;
+
+	id procId = NULL;
+	if (idCls) {
+		SEL s = sel_registerName("identifierWithPid:");
+		if (class_respondsToSelector(object_getClass((id)idCls), s)) {
+			procId = ((id (*)(id, SEL, int))objc_msgSend)((id)idCls, s, (int)mypid);
+		}
+	}
+
+	id procIdent = NULL;
+	if (identCls) {
+		SEL s = sel_registerName("identityForEmbeddedApplicationIdentifier:jobLabel:auid:platform:");
+		if (class_respondsToSelector(object_getClass((id)identCls), s)) {
+			CFStringRef bundleId = CFSTR("com.apple.springboard");
+			procIdent = ((id (*)(id, SEL, id, id, unsigned int, int))objc_msgSend)(
+			    (id)identCls, s, (id)bundleId, (id)bundleId, 0, 2);
+		}
+		if (!procIdent) {
+			SEL s2 = sel_registerName("identityForExecutablePath:pid:auid:");
+			if (class_respondsToSelector(object_getClass((id)identCls), s2)) {
+				CFStringRef path = CFSTR("/System/Library/CoreServices/SpringBoard.app/SpringBoard");
+				procIdent = ((id (*)(id, SEL, id, int, unsigned int))objc_msgSend)(
+				    (id)identCls, s2, (id)path, (int)mypid, 0);
+			}
+		}
+	}
+
+	id handle = ((id (*)(id, SEL))objc_msgSend)((id)handleCls, sel_registerName("alloc"));
+	if (handle) {
+		if (procId) {
+			Ivar iv = class_getInstanceVariable(handleCls, "_pid");
+			if (iv) *(int *)((uintptr_t)handle + ivar_getOffset(iv)) = (int)mypid;
+		}
+		if (procIdent) {
+			Ivar iv = class_getInstanceVariable(handleCls, "_identity");
+			if (iv) object_setIvar(handle, iv, procIdent);
+		}
+	}
+	return handle;
+}
+
+static xpc_object_t
+sb_make_fake_rbs_reply(xpc_object_t request_msg)
+{
+	const char *selector = request_msg != NULL ?
+	    xpc_dictionary_get_string(request_msg, "rbs_selector") : NULL;
+	say("hakios: sb fix136 synthesizing RBS reply for selector=\"%s\"\n",
+	    selector ? selector : "(null)");
+
+	Class coderCls = objc_getClass("BSXPCCoder");
+	if (coderCls) {
+		SEL coderSel = sel_registerName("coder");
+		SEL encodeSel = sel_registerName("encodeObject:forKey:");
+		SEL createMsgSel = sel_registerName("createMessage");
+
+		if (class_respondsToSelector(object_getClass((id)coderCls), coderSel)) {
+			id coder = ((id (*)(id, SEL))objc_msgSend)((id)coderCls, coderSel);
+			if (coder &&
+			    class_respondsToSelector(coderCls, encodeSel) &&
+			    class_respondsToSelector(coderCls, createMsgSel)) {
+
+				if (selector && strcmp(selector, "acquireAssertionWithDescriptor:error:") == 0) {
+					Class assertIdCls = objc_getClass("RBSAssertionIdentifier");
+					id assertId = NULL;
+					if (assertIdCls) {
+						SEL s = sel_registerName("identifierWithClientPid:");
+						if (class_respondsToSelector(object_getClass((id)assertIdCls), s)) {
+							assertId = ((id (*)(id, SEL, int))objc_msgSend)(
+							    (id)assertIdCls, s, (int)getpid());
+						}
+					}
+					if (assertId) {
+						((void (*)(id, SEL, id, id))objc_msgSend)(
+						    coder, encodeSel, assertId, (id)CFSTR("rbs_return"));
+						xpc_object_t reply = ((xpc_object_t (*)(id, SEL))objc_msgSend)(
+						    coder, createMsgSel);
+						if (reply) {
+							say("hakios: sb fix136 encoded RBSAssertionIdentifier(%p) -> %p\n",
+							    (void *)assertId, (void *)reply);
+							return reply;
+						}
+					}
+				} else {
+					Class respCls = objc_getClass("RBSHandshakeResponse");
+					id resp = respCls ? ((id (*)(id, SEL))objc_msgSend)(
+					    ((id (*)(id, SEL))objc_msgSend)((id)respCls, sel_registerName("alloc")),
+					    sel_registerName("init")) : NULL;
+					id handle = sb_build_rbs_process_handle();
+
+					if (resp && handle) {
+						SEL setHandleSel = sel_registerName("setHandle:");
+						if (class_respondsToSelector(respCls, setHandleSel)) {
+							((void (*)(id, SEL, id))objc_msgSend)(resp, setHandleSel, handle);
+						} else {
+							Ivar iv = class_getInstanceVariable(respCls, "_handle");
+							if (iv) object_setIvar(resp, iv, handle);
+						}
+					}
+					if (handle) {
+						sb_populate_rbs_connection_ivars(handle);
+					}
+					if (resp) {
+						((void (*)(id, SEL, id, id))objc_msgSend)(
+						    coder, encodeSel, resp, (id)CFSTR("rbs_return"));
+						xpc_object_t reply = ((xpc_object_t (*)(id, SEL))objc_msgSend)(
+						    coder, createMsgSel);
+						if (reply) {
+							say("hakios: sb fix136 encoded RBSHandshakeResponse(%p, handle=%p) -> %p\n",
+							    (void *)resp, (void *)handle, (void *)reply);
+							return reply;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	xpc_object_t fallback = xpc_dictionary_create(NULL, NULL, 0);
+	xpc_object_t ret_dict = xpc_dictionary_create(NULL, NULL, 0);
+	if (fallback && ret_dict) {
+		xpc_dictionary_set_string(ret_dict, "bsx_class",
+		    (selector && strcmp(selector, "acquireAssertionWithDescriptor:error:") == 0)
+		        ? "RBSAssertionIdentifier"
+		        : "RBSHandshakeResponse");
+		xpc_dictionary_set_value(fallback, "rbs_return", ret_dict);
+	}
+	return fallback;
+}
+
+/* fix144: the lsd mapdb/anonymous protocol hides an NSKeyedArchiver bplist in
+ * the "root" data; xpc_copy_description only shows 40 bytes, so dump it whole. */
+static void
+sb_say_root_data(const char *label, xpc_object_t message)
+{
+	xpc_object_t root = message != NULL ? xpc_dictionary_get_value(message, "root") : NULL;
+	xpc_type_t type = root != NULL ? xpc_get_type(root) : NULL;
+	const char *tname = type != NULL ? xpc_type_get_name(type) : NULL;
+	const uint8_t *bytes;
+	size_t len, n, i;
+	char hex[3 * 256 + 1];
+
+	if (tname == NULL || strcmp(tname, "data") != 0) {
+		return;
+	}
+	bytes = xpc_data_get_bytes_ptr(root);
+	len = xpc_data_get_length(root);
+	n = len < 256 ? len : 256;
+	for (i = 0; i < n; i++) {
+		snprintf(hex + i * 3, 4, "%02x ", bytes[i]);
+	}
+	hex[n * 3] = '\0';
+	say("hakios: sb %s root len=%zu hex=%s\n", label, len, hex);
+}
+
+struct sb_reply_wait {
+	semaphore_t sem;
+	unsigned seconds;
+	volatile int replied;
+	volatile int timed_out;
+	xpc_object_t reply;
+};
+
+static void *
+sb_reply_timeout_thread(void *arg)
+{
+	struct sb_reply_wait *w = arg;
+
+	for (unsigned i = 0; i < w->seconds; i++) {
+		usleep(1000000);
+	}
+	if (!w->replied) {
+		w->timed_out = 1;
+		semaphore_signal(w->sem);
+	}
+	return NULL;
+}
+
+/* fix143: this XNU's waitq deadlines do not wake timed semaphore/ulock waits, so a
+ * timed wait can hang forever.  A detached watchdog thread (usleep works) signals
+ * the semaphore at the deadline; the caller waits without a kernel timeout. */
+static xpc_object_t
+sb_send_with_timeout(xpc_connection_t connection, xpc_object_t message, dispatch_queue_t queue,
+    unsigned seconds, bool *timed_out)
+{
+	struct sb_reply_wait *w = calloc(1, sizeof(*w));
+	pthread_t thread;
+	bool has_watchdog = false;
+
+	if (timed_out != NULL) {
+		*timed_out = false;
+	}
+	if (w == NULL) {
+		return NULL;
+	}
+	w->seconds = seconds;
+	if (semaphore_create(mach_task_self(), &w->sem, SYNC_POLICY_FIFO, 0) != KERN_SUCCESS) {
+		free(w);
+		return NULL;
+	}
+	if (seconds > 0 && pthread_create(&thread, NULL, sb_reply_timeout_thread, w) == 0) {
+		pthread_detach(thread);
+		has_watchdog = true;
+	}
+	xpc_connection_send_message_with_reply(connection, message, queue, ^(xpc_object_t object) {
+		w->reply = object != NULL ? xpc_retain(object) : NULL;
+		w->replied = 1;
+		semaphore_signal(w->sem);
+	});
+	/* fix144: seconds == 0 means wait for the real reply (no watchdog); the
+	 * anonymous lsd endpoint answers late, but answers. */
+	if (has_watchdog || seconds == 0) {
+		semaphore_wait(w->sem);
+	} else {
+		mach_timespec_t wait_time = { seconds, 0 };
+
+		semaphore_timedwait(w->sem, wait_time);
+	}
+	if (timed_out != NULL) {
+		*timed_out = (w->reply == NULL);
+	}
+	return w->reply;
+}
+
+static xpc_object_t sb_lsd_mapdb_reply;
+
+static int
+sb_message_has_root_selector(xpc_object_t message, const char *selector)
+{
+	xpc_object_t root = xpc_dictionary_get_value(message, "root");
+	const void *bytes;
+	size_t length, i, slen;
+
+	if (root == NULL) {
+		return 0;
+	}
+	bytes = xpc_data_get_bytes_ptr(root);
+	length = xpc_data_get_length(root);
+	if (bytes == NULL || length == 0 || selector == NULL) {
+		return 0;
+	}
+	slen = strlen(selector);
+	if (length < slen) {
+		return 0;
+	}
+	for (i = 0; i + slen <= length; i++) {
+		if (memcmp((const char *)bytes + i, selector, slen) == 0) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+__attribute__((used)) static xpc_object_t
+sb_xpc_send_sync(xpc_connection_t connection, xpc_object_t message)
+{
+	static unsigned anonymous;
+	const char *name = connection != NULL ? xpc_connection_get_name(connection) : NULL;
+	bool said = name != NULL ? sb_worth_saying(name) : (++anonymous <= 20);
+
+	if (said) {
+		say("hakios: sb xpc sync send \"%s\" message %p\n", name ? name : "(no name)", message);
+		if (name == NULL ||
+		    strcmp(name, "com.apple.runningboard") == 0 ||
+		    strncmp(name, "com.apple.lsd", 13) == 0 ||
+		    strncmp(name, "com.apple.iconservices", 22) == 0) {
+			sb_xpc_say_object("fix127 sync request", name ? name : "(no name)", message);
+		}
+	}
+	/* fix118/fix138: cfprefsd ve mobileactivationd imajda yok, aninda bos sozluk don */
+	if (name != NULL && (strcmp(name, "com.apple.cfprefsd.daemon") == 0 ||
+	                     strcmp(name, "com.apple.cfprefsd.agent") == 0 ||
+	                     strcmp(name, "com.apple.mobileactivationd") == 0)) {
+		return xpc_dictionary_create(NULL, NULL, 0);
+	}
+	/* fix136: runningboardd icin 20 sn watchdog + BSXPCCoder fallback */
+	if (name != NULL && strcmp(name, "com.apple.runningboard") == 0) {
+		static dispatch_queue_t replyq;
+		xpc_object_t reply;
+		bool timed_out = false;
+
+		if (replyq == NULL) {
+			replyq = dispatch_queue_create("hakios.rbs.reply", NULL);
+		}
+		reply = sb_send_with_timeout(connection, message, replyq, 20, &timed_out);
+		if (reply != NULL) {
+			xpc_type_t t = xpc_get_type(reply);
+			const char *tname = t != NULL ? xpc_type_get_name(t) : "null";
+
+			say("hakios: sb fix136 runningboard reply arrived (type=%s)\n", tname);
+			sb_xpc_say_object("fix136 reply", name, reply);
+			if (tname != NULL && strcmp(tname, "dictionary") == 0) {
+				return reply;
+			}
+			say("hakios: sb fix136 runningboard reply is %s (not dictionary), using BSXPCCoder fallback\n",
+			    tname ? tname : "null");
+			return sb_make_fake_rbs_reply(message);
+		}
+		say("hakios: sb fix136 runningboard reply did not come in 20 s, using BSXPCCoder fallback\n");
+		return sb_make_fake_rbs_reply(message);
+	}
+	/* fix148: the anonymous lsd endpoint is called by SpringBoard, not by lsd.
+	 * fix147's lsd-side bypass therefore never fired.  Waiting forever here pins
+	 * CoreServices' ulock; return an XPC error at once so the caller sees a
+	 * failed connection instead of a fake empty reply.  Only the lsd anonymous
+	 * request is matched, not every anonymous sync call. */
+	if (name == NULL &&
+	    sb_message_has_root_selector(message, "getServerStoreBlockingWithCompletionHandler:")) {
+		/* fix156: do not send the blocking call into lsd at all.  The caller's
+		 * completion block is v32@?0@8@"FSNode"16@"NSError"24, so answer with a
+		 * bplist17 invocation carrying FSNode=nil and NSError=nil.  This releases
+		 * CoreServices' ulock without waiting for lsd/containermanagerd. */
+		static const unsigned char blocking_root[] = {
+			0x62, 0x70, 0x6c, 0x69, 0x73, 0x74, 0x31, 0x37, 0xa0, 0x38,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x7f, 0x11,
+			0x18, 0x76, 0x40, 0x3f, 0x40, 0x40, 0x22, 0x46, 0x53, 0x4e,
+			0x6f, 0x64, 0x65, 0x22, 0x40, 0x22, 0x4e, 0x53, 0x45, 0x72,
+			0x72, 0x6f, 0x72, 0x22, 0x00, 0xa0, 0x38, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0xe0, 0xe0, 0xe0
+		};
+		xpc_object_t data = xpc_data_create(blocking_root, sizeof(blocking_root));
+		xpc_object_t synth = xpc_dictionary_create(NULL, NULL, 0);
+
+		xpc_dictionary_set_value(synth, "root", data);
+		xpc_release(data);
+		say("hakios: sb fix158 anonymous lsd -> synthetic blocking reply (FSNode=nil NSError=nil)\n");
+		return synth;
+	}
+	/* fix138/fix144: lsd.mapdb 60 sn icinde yanitlamazsa bos dict don. */
+	if (name != NULL && strncmp(name, "com.apple.lsd", 13) == 0) {
+		static dispatch_queue_t lsd_replyq;
+		xpc_object_t reply;
+		bool timed_out = false;
+		const char *label = name;
+		unsigned wait = 60;
+
+		if (lsd_replyq == NULL) {
+			lsd_replyq = dispatch_queue_create("hakios.lsd.reply", NULL);
+		}
+		sb_say_root_data("fix144 request", message);
+		reply = sb_send_with_timeout(connection, message, lsd_replyq, wait, &timed_out);
+		if (reply != NULL) {
+			xpc_type_t t = xpc_get_type(reply);
+			const char *tname = t != NULL ? xpc_type_get_name(t) : "null";
+
+			say("hakios: sb fix138 sync reply from \"%s\" arrived (type=%s)\n", label, tname);
+			sb_xpc_say_object("fix138 reply", label, reply);
+			sb_say_root_data("fix144 reply", reply);
+			if (tname != NULL && strcmp(tname, "dictionary") == 0) {
+				if (strcmp(label, "com.apple.lsd.mapdb") == 0) {
+					if (sb_lsd_mapdb_reply != NULL) {
+						xpc_release(sb_lsd_mapdb_reply);
+					}
+					sb_lsd_mapdb_reply = xpc_retain(reply);
+					say("hakios: sb fix150 cached lsd.mapdb reply %p\n",
+					    sb_lsd_mapdb_reply);
+				}
+				return reply;
+			}
+			say("hakios: sb fix138 reply from \"%s\" is %s, returning empty dict to release ulock\n",
+			    label, tname ? tname : "null");
+			return xpc_dictionary_create(NULL, NULL, 0);
+		}
+		say("hakios: sb fix138 sync send to \"%s\" timed out after %u s -> returning empty dict to release CoreServices ulock!\n",
+		    label, wait);
+		return xpc_dictionary_create(NULL, NULL, 0);
+	}
+	/* fix141/fix143: any other sync XPC (FrontBoard/CoreServices/Foundation) that
+	 * does not reply must not pin an os_unfair_lock forever. */
+	{
+		static dispatch_queue_t generic_replyq;
+		static unsigned generic_logged;
+		xpc_object_t reply;
+		bool timed_out = false;
+		const char *label = name != NULL ? name : "(no name)";
+
+		if (generic_logged < 48) {
+			generic_logged++;
+			say("hakios: sb fix141 generic sync send[%u] \"%s\" message %p\n",
+			    generic_logged, label, message);
+		}
+		if (generic_replyq == NULL) {
+			generic_replyq = dispatch_queue_create("hakios.generic.reply", NULL);
+		}
+		reply = sb_send_with_timeout(connection, message, generic_replyq, 10, &timed_out);
+		if (reply != NULL) {
+			return reply;
+		}
+		say("hakios: sb fix141 sync send to \"%s\" timed out after 10 s -> returning empty dict\n",
+		    label);
+		return xpc_dictionary_create(NULL, NULL, 0);
+	}
+}
+
+static bool
+sb_board_connection(const char *name)
+{
+	return name != NULL && strstr(name, "board") != NULL;
+}
+
+/* four of each kind about a connection says the story; the fifth repeats it */
+static bool
+sb_board_worth_saying(const char *kind, const char *name)
+{
+	static struct {
+		const char *kind;
+		char *name;
+		unsigned n;
+	} seen[64];
+	static unsigned count;
+
+	for (unsigned i = 0; i < count; i++) {
+		if (strcmp(seen[i].kind, kind) == 0 && strcmp(seen[i].name, name) == 0) {
+			return ++seen[i].n <= 4;
+		}
+	}
+	if (count < 64 && (seen[count].kind = strdup(kind)) != NULL &&
+	    (seen[count].name = strdup(name)) != NULL) {
+		seen[count++].n = 1;
+		return true;
+	}
+	return false;
+}
+
+/* Bounded descriptions; the proven sync path gets enough room to expose request keys. */
+static void
+sb_xpc_say_object(const char *what, const char *name, xpc_object_t object)
+{
+	char *desc = object != NULL ? xpc_copy_description(object) : NULL;
+	size_t limit = strcmp(what, "fix127 sync request") == 0 ? 960 : 190;
+
+	if (desc != NULL) {
+		for (char *p = desc; *p != '\0'; p++) {
+			if (*p == '\n') {
+				*p = ' ';
+			}
+		}
+		if (strlen(desc) > limit) {
+			desc[limit] = '\0';
+		}
+		say("hakios: sb %s \"%s\": %s\n", what, name, desc);
+		free(desc);
+	} else {
+		say("hakios: sb %s \"%s\": (nothing to describe)\n", what, name);
+	}
+}
+
+__attribute__((used)) static void
+sb_xpc_set_event_handler(xpc_connection_t connection, sb_xpc_handler_t handler)
+{
+	const char *name = connection != NULL ? xpc_connection_get_name(connection) : NULL;
+
+	if (!sb_board_connection(name) || handler == NULL) {
+		xpc_connection_set_event_handler(connection, handler);
+		return;
+	}
+	sb_xpc_handler_t target = handler;
+	char *who = strdup(name);
+
+	say("hakios: sb event handler for \"%s\" wrapped\n", name);
+	xpc_connection_set_event_handler(connection, ^(xpc_object_t event) {
+		xpc_type_t type = event != NULL ? xpc_get_type(event) : NULL;
+
+		if (sb_board_worth_saying("event", who)) {
+			say("hakios: sb event for \"%s\" type %s\n", who,
+			    type != NULL ? xpc_type_get_name(type) : "null");
+			sb_xpc_say_object("event body", who, event);
+		}
+		target(event);
+	});
+}
+
+__attribute__((used)) static void
+sb_xpc_send_async(xpc_connection_t connection, xpc_object_t message)
+{
+	const char *name = connection != NULL ? xpc_connection_get_name(connection) : NULL;
+
+	if (sb_board_connection(name) && sb_board_worth_saying("send", name)) {
+		sb_xpc_say_object("async send", name, message);
+	}
+	xpc_connection_send_message(connection, message);
+}
+
+__attribute__((used)) static void
+sb_xpc_send_with_reply(xpc_connection_t connection, xpc_object_t message,
+    dispatch_queue_t queue, sb_xpc_handler_t handler)
+{
+	const char *name = connection != NULL ? xpc_connection_get_name(connection) : NULL;
+
+	if (!sb_board_connection(name) || handler == NULL) {
+		xpc_connection_send_message_with_reply(connection, message, queue, handler);
+		return;
+	}
+	char *who = strdup(name);
+	sb_xpc_handler_t target = handler;
+	if (sb_board_worth_saying("send-reply", who)) {
+		sb_xpc_say_object("async send-with-reply", who, message);
+	}
+	xpc_connection_send_message_with_reply(connection, message, queue, ^(xpc_object_t reply) {
+		xpc_type_t type = reply != NULL ? xpc_get_type(reply) : NULL;
+
+		if (sb_board_worth_saying("reply", who)) {
+			say("hakios: sb async reply for \"%s\" type %s\n", who,
+			    type != NULL ? xpc_type_get_name(type) : "null");
+			sb_xpc_say_object("async reply body", who, reply);
+		}
+		target(reply);
+	});
+}
+
+
+__attribute__((used)) static struct {
+	const void *replacement;
+	const void *replacee;
+} sb_interposers[] __attribute__((section("__DATA,__interpose"))) = {
+	{ (const void *) sb_bootstrap_look_up, (const void *) bootstrap_look_up },
+	{ (const void *) sb_bootstrap_look_up2, (const void *) bootstrap_look_up2 },
+	{ (const void *) sb_xpc_connection_create_mach_service,
+		(const void *) xpc_connection_create_mach_service },
+	{ (const void *) sb_xpc_send_sync, (const void *) xpc_connection_send_message_with_reply_sync },
+	{ (const void *) sb_xpc_send_async, (const void *) xpc_connection_send_message },
+	{ (const void *) sb_xpc_send_with_reply,
+		(const void *) xpc_connection_send_message_with_reply },
+	{ (const void *) sb_xpc_set_event_handler, (const void *) xpc_connection_set_event_handler },
+};
+
+
+static void
+sb_main_thread_start(void)
+{
+	say("hakios: main loop timer: the +1 s work runs\n");
+	say_console("hakios: main loop timer console write works\n");
+	Class uidev = objc_getClass("UIDevice");
+	SEL current = sel_registerName("currentDevice");
+	SEL monitoring = sel_registerName("setBatteryMonitoringEnabled:");
+	id device = uidev ? ((id (*)(Class, SEL))objc_msgSend)(uidev, current) : nil;
+
+	if (device && class_getInstanceMethod(object_getClass(device), monitoring)) {
+		((void (*)(id, SEL, BOOL))objc_msgSend)(device, monitoring, YES);
+	}
+	watch_main_loop();
+	{
+		CFRunLoopTimerRef timer = CFRunLoopTimerCreateWithHandler(NULL, CFAbsoluteTimeGetCurrent() + 15.0, 0, 0, 0,
+		    ^(__unused CFRunLoopTimerRef fired) {
+			say("hakios: SB delayed layers dump (+15 s, run loop timer)\n");
+			layers();
+		    });
+
+		if (timer != NULL) {
+			CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
+			CFRelease(timer);
+		}
+	}
+	{
+		char arguments[1024] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+			control_center_fades(arguments);
+		}
+	}
+	say("hakios: battery: SOC=%d%% battery=%d charger=%d charging=%d\n",
+	    sysctl_int("kern.hakios.battery_soc"), sysctl_int("kern.hakios.battery_present"),
+	    sysctl_int("kern.hakios.battery_charger_present"), sysctl_int("kern.hakios.battery_charging"));
+	battery_post_notifications();
+}
+
+
+__attribute__((constructor))
+static void
+sb_interpose_hello(void)
+{
+	say("hakios: sb fix118 interposers installed (lookup v1/v2, xpc create, xpc sync send; "
+	    "fix125 async send + event handler; fix127 sync-request trace)\n");
+}
+
 __attribute__((constructor))
 static void
 hakios_springboard_init(void)
@@ -1254,7 +2663,9 @@ hakios_springboard_init(void)
 	 * this one opens it, the way a jailbreak's own hook does.
 	 */
 	load_tweaks();
+	sb_install_cacontext_trace();
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
+	watch_main_thread();
 	activation = replace_method("SBLockdownManager", "_setupActivationState", 0x1c4bc8dfcUL, (IMP)setup_activation_state);
 	original_set_setup_required_reason = (void (*)(id, SEL, long))replace_method("SBSetupManager",
 	    "_setSetupRequiredReason:", 0x1c4cdd3a4UL, (IMP)set_setup_required_reason);
@@ -1345,33 +2756,22 @@ hakios_springboard_init(void)
 		}
 	}
 	/*
-	 * UIDevice won't call batteryLevel/batteryState unless monitoring is enabled. Flip it on once
-	 * SpringBoard's run loop is running (the dispatch_after fires on the main queue, which means
-	 * we are past UIApplication startup).
+	 * fix163: SpringBoard's main dispatch queue is not serviced here (the main thread is in
+	 * UIApplicationMain/GSEventRunModal and the mainq count stays 0), so dispatch_after never
+	 * fires. The main run loop itself does turn; schedule the same work with a run loop timer.
 	 */
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-		Class uidev = objc_getClass("UIDevice");
-		SEL current = sel_registerName("currentDevice");
-		SEL monitoring = sel_registerName("setBatteryMonitoringEnabled:");
-		id device = uidev ? ((id (*)(Class, SEL))objc_msgSend)(uidev, current) : nil;
+	{
+		CFRunLoopTimerRef timer = CFRunLoopTimerCreateWithHandler(NULL, CFAbsoluteTimeGetCurrent() + 1.0, 0, 0, 0,
+		    ^(__unused CFRunLoopTimerRef fired) {
+			sb_main_thread_start();
+		    });
 
-		if (device && class_getInstanceMethod(object_getClass(device), monitoring)) {
-			((void (*)(id, SEL, BOOL))objc_msgSend)(device, monitoring, YES);
+		if (timer != NULL) {
+			CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
+			CFRelease(timer);
+			CFRunLoopWakeUp(CFRunLoopGetMain());
 		}
-		watch_main_loop();
-		{
-			char arguments[1024] = "";
-			size_t size = sizeof(arguments) - 1;
-
-			if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
-				control_center_fades(arguments);
-			}
-		}
-		say("hakios: battery: SOC=%d%% battery=%d charger=%d charging=%d\n",
-		    sysctl_int("kern.hakios.battery_soc"), sysctl_int("kern.hakios.battery_present"),
-		    sysctl_int("kern.hakios.battery_charger_present"), sysctl_int("kern.hakios.battery_charging"));
-		battery_post_notifications();
-	});
+	}
 	notify_register_dispatch("com.hakios.unlock", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		unlock();
 	});
@@ -1403,7 +2803,16 @@ hakios_springboard_init(void)
 			return;
 		}
 	}
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-		unlock();
-	});
+	{
+		CFRunLoopTimerRef timer = CFRunLoopTimerCreateWithHandler(NULL, CFAbsoluteTimeGetCurrent() + 10.0, 0, 0, 0,
+		    ^(__unused CFRunLoopTimerRef fired) {
+			unlock();
+		    });
+
+		if (timer != NULL) {
+			CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
+			CFRelease(timer);
+			CFRunLoopWakeUp(CFRunLoopGetMain());
+		}
+	}
 }

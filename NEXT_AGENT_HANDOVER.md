@@ -123,7 +123,24 @@ bu portta kimse temizlemiyor -> window server hiç yüzey ayırmıyor -> mavi ek
 | Boot + log | `tools/boot-capture.py` (adb->bootloader fallback'lı) | — |
 | Shim (shell, loader_return, charger) | `shim-shamrock/` (gitignore) | `shim.c` satır 263+: shell |
 
-## 6. Derleme ve Test (tek tur)
+## 6. fix128 / fix129 (1 Kasım 2026) — panel mavi, ama artık kök neden belli
+
+fix127 (`ca_vbl=1`, 60 Hz vsync çalışıyor, 27 swap, kr 0): panel hâlâ mavi/siyah. 60 Hz vsync geçişi kare oranını 0,5 fps'ten hareket ettirmedi -> vsync açlığı değil.
+
+fix128 (çekirdekte `surface probe` eklendi, `xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp`):
+- swap 1: `head ffffffff mid ff0000ff tail ff0000ff nz=1024/1k` — yüzey **boş değil**, başlangıçta renk barları.
+- swap 2..6: `head 0000ffff mid ff0000ff tail ff0000ff nz=512/1k` — **her swapte aynı statik mavi-tonlu içerik**; dst=fBase, pushPanel/CTL_START çalışıyor.
+- Çıkarım: kernel→panel yazım yolu tamamen çalışıyor; panel mavi çünkü CoreAnimation tek statik bir kare (mui muhtemelen ilk temizleme) çizip asla güncellemiyor. `kick_display`: begin=finish=render=0.
+
+fix129 (userland/src/inject.c `ca_display_probe_fixes`): backboardd'ın boot'ta yazdığı ve asla temizlemediği
+  `disabling framebuffer changes on display (1)` (`_kCAWindowServerDisableUpdatesOnMainDisplay`, fix128 log line 1615) işletim sistemi dondurma bayrağı. `-disablesUpdates` getter'ını loglar, `-setDisablesUpdates:` çağrısında değeri her zaman **NO** yapar.
+- Imaj hazır: `out/shamrock-shim-boot.img` (1 Kasım 12:48, fix127 cmdline'ıyla aynı: `ca_vbl=1 fb_vsync_*`...).
+- **ENGEL:** cihaz şu an XNU içinde (fix128'den sonra kalıyor, rain yok, otomatik geri dönüş yok). `fastboot devices` boş. fix129'u boot edebilmek için cihaz `VOL- + Power` ile fastboot'a alınmalı, sonra:
+  `python3 tools/autoloop.py --tag fix129 --wait 30 --seconds 660 --idle 240`
+
+fix129 başarı kriteri: `disablesUpdates -> 0` satırları + swap'ler arasındaki yüzey içeriği değişmeye başlayıp panelde canlı içerik. Başarısız olursa sonraki adım `+[CAWindowServer serverWithOptions:]` çağrısı / CADisplayTimer akışı (fix77/78 yöntemiyle `-update` çağrılarının gerçekten düştüğü yeri bulmak).
+
+## 7. Derleme ve Test (tek tur)
 
 ```bash
 # userland değiştiyse

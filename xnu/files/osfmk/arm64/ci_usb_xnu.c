@@ -93,6 +93,15 @@ static volatile uint32_t log_head = 0, log_tail = 0, log_dropped = 0;
 static uint8_t  rx_ring[RX_RING_SIZE];
 static volatile uint32_t rx_head = 0, rx_tail = 0;
 
+/* fix89b: the [HB] line shows this counter.  A log that goes quiet with dropped=0 died host-side
+ * (or in the pump); quiet with dropped>0 means the ring filled because the pump stopped draining.
+ * Until now the counter was written at both ring-full sites and printed nowhere. */
+uint32_t
+ci_usb_log_dropped(void)
+{
+	return log_dropped;
+}
+
 /* Controller State */
 static uintptr_t base = 0;
 static uintptr_t cap_base = 0;
@@ -422,6 +431,50 @@ static void ci_log_pump(void)
 	ep1_tx_busy = true;
 	ep1_prime_tick = get_ticks();
 	prime_ep(1, 1, &g_dma->dtd_ep1_in);
+
+	/*
+	 * fix74: packet-boundary watchdog food and tx beacon.  This is the one choke point every
+	 * byte the kernel has actually handed the host passes through -- the loader-log mirror,
+	 * the printf lines, all of it rides this ring (fix73's beacon sat in putc_raw, which the
+	 * console never walks: zero beacons in a 188 KB log).  Feeding here feeds the path that
+	 * runs during the boot storm, when the thread_call and idle contexts are both starved;
+	 * one beacon per 4 KB sent brackets any death by the kernel's own clock.
+	 */
+	{
+		extern void hv_wdt_pet_now(void);
+		extern int hakios_bringup_log_ready;
+		static uint64_t tx_sent, tx_ord;
+
+		tx_sent += avail;
+		hv_wdt_pet_now();
+
+		if (hakios_bringup_log_ready && (tx_sent >> 12) != tx_ord) {
+			static const char nib[] = "0123456789abcdef";
+			char line[40];
+			char *p = line;
+			uint64_t v;
+			int i;
+
+			tx_ord = tx_sent >> 12;
+			*p++ = '\r'; *p++ = '\n';
+			*p++ = 't'; *p++ = 'x'; *p++ = ' ';
+			for (i = 60; i >= 0; i -= 4) {
+				*p++ = nib[(mach_absolute_time() >> i) & 0xF];
+			}
+			*p++ = ' ';
+			v = tx_ord;
+			{
+				char tmp[16];
+				char *q = tmp;
+				do { *q++ = nib[v & 0xF]; v >>= 4; } while (v);
+				while (q != tmp) { *p++ = *--q; }
+			}
+			*p++ = '\n';
+			for (i = 0; i < p - line; i++) {
+				ci_usb_xnu_putc_ring_only(line[i]);
+			}
+		}
+	}
 
 	/* Synchronous drain: spin-wait up to 1.5ms (28800 ticks) so during DAIF.I=1 boot,
 	 * data actually gets sent to host over USB! */
@@ -754,6 +807,56 @@ void ci_usb_xnu_putc_raw(char c)
 
 	os_atomic_store(&ci_tx_lock, 0, release);
 	__builtin_arm_wsr64("DAIF", daif);
+
+	/*
+	 * fix73: this is the funnel -- every character the kernel prints passes here, at all times,
+	 * from every context.  Two things ride on it, both proven homeless elsewhere: the hypervisor
+	 * watchdog's food (its thread_call starves in the boot storm, and a 65-second-old feed is
+	 * exactly the boards' 40-90 s death), and one tx beacon per 4 KB so that the last beacon
+	 * brackets a death in kernel time.  Recursion: the beacon's own characters re-enter here,
+	 * guarded by the flag; the pet is rate-limited in its own body.
+	 */
+	{
+		extern void hv_wdt_pet_now(void);
+		extern int hakios_bringup_log_ready;
+		static uint64_t tx_count;
+		static int in_beacon;
+
+		hv_wdt_pet_now();
+
+		if (!in_beacon) {
+			uint64_t n = ++tx_count;
+			if (hakios_bringup_log_ready && (n & 0xFFFU) == 0) {
+				static const char nib[] = "0123456789abcdef";
+				char line[40];
+				char *p = line;
+				uint64_t v;
+				int i;
+
+				in_beacon = 1;
+				*p++ = 't'; *p++ = 'x'; *p++ = ' ';
+				for (i = 60; i >= 0; i -= 4) {
+					*p++ = nib[(mach_absolute_time() >> i) & 0xF];
+				}
+				*p++ = ' ';
+				v = n >> 12;
+				{
+					char tmp[16];
+					char *q = tmp;
+					do { *q++ = nib[v & 0xF]; v >>= 4; } while (v);
+					while (q != tmp) { *p++ = *--q; }
+				}
+				*p++ = '\n';
+				for (i = 0; i < p - line; i++) {
+					if (line[i] == '\n') {
+						ci_usb_xnu_putc_raw('\r');
+					}
+					ci_usb_xnu_putc_raw(line[i]);
+				}
+				in_beacon = 0;
+			}
+		}
+	}
 }
 
 void ci_usb_xnu_putc(char c)

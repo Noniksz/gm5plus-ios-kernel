@@ -66,6 +66,7 @@ extern void hakios_wifi_stop(void);
 extern void hakios_wifi_quiesce(void);
 extern void hakios_adsp_stop(void);
 extern void hakios_adsp_quiesce(void);
+extern uint32_t ci_usb_log_dropped(void);	/* fix89b: ci_usb_xnu.c's ring-full counter, shown on the [HB] line */
 extern void hakios_mpss_stop(void);
 extern void hakios_mpss_quiesce(void);
 extern void hakios_ddr_quiesce(void);
@@ -646,11 +647,32 @@ memory_report(void)
 	hakios_adreno_minute();                /* (and how warm the GPU is, if it is in use) */
 }
 
-/* Every HV_WDT_PET_SECONDS: feed the watchdog if there is one, and show any watching loader a sign of life. */
-static void
-hv_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+/* fix73: the pet itself, callable from any context.  The thread_call below has proven useless
+ * during the boot storm (fix69: its workloop never runs there), and LK armed the hypervisor's
+ * watchdog -- at most 65 real seconds -- before it jumped to us; every board has died 40-90 s
+ * into the user phase with a warm reset and no trace in any register we can read.  So the pet
+ * must run where the storm cannot starve it: from the idle poll and from the console write
+ * path.  Rate-limited by kernel time (the clock badly fast: 200 ms of it is well under a real
+ * tenth of a second), so calling it per console character costs nothing.  The first SMC's
+ * return value is kept and printed at boot: QTEE answers 0 for a pet it knows, and an error
+ * for one it does not -- that answer tells us whether this watchdog is even ours to feed. */
+uint64_t hakios_hv_pet_count;
+uint64_t hakios_hv_pet_first_ret = 0xdeadbeef;
+
+void
+hv_wdt_pet_now(void)
 {
-	uint64_t deadline;
+	static uint64_t lastPet;
+	uint64_t now = mach_absolute_time();
+
+	/* fix74b: the limiter must not swallow the first real feed.  Early boot already calls
+	 * this from the idle poll while hv_wdt_enabled is still 0 -- that armed lastPet, and the
+	 * first enabled call rate-limited away: fix73b printed "fed 0 times" and the SMC never
+	 * ran once.  With nothing fed yet there is nothing to limit. */
+	if (hakios_hv_pet_count != 0 && lastPet != 0 && now - lastPet < 200000ULL) {
+		return;
+	}
+	lastPet = now;
 
 	/* Feed MSM8952 APCS KPSS hardware watchdog */
 	if (!s_loader_apcs_wdt) {
@@ -677,7 +699,21 @@ hv_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 
 		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : :
 		    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17");
+		if (hakios_hv_pet_first_ret == 0xdeadbeef) {
+			hakios_hv_pet_first_ret = x0;
+		}
+		hakios_hv_pet_count++;
 	}
+}
+
+/* Every HV_WDT_PET_SECONDS: feed the watchdog if there is one, and show any watching loader a sign of life. */
+static void
+hv_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint64_t deadline;
+
+	hv_wdt_pet_now();
+
 	uint64_t beat = ++loader_live.heartbeat;
 	/*
 	 * BRINGUP: one line per beat.  A boot that goes quiet is then either "the kernel is
@@ -685,8 +721,8 @@ hv_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	 * stall on an unclocked peripheral, a spin with interrupts off -- which is what a
 	 * missing line proves.
 	 */
-	printf("[HB] heartbeat %lu, %lu s since start\n", (unsigned long)beat,
-	    (unsigned long)(beat * HV_WDT_PET_SECONDS));
+	printf("[HB] heartbeat %lu, %lu s since start, dropped=%u\n", (unsigned long)beat,
+	    (unsigned long)(beat * HV_WDT_PET_SECONDS), ci_usb_log_dropped());
 	if (beat % MEMORY_REPORT_BEATS == 0) {
 		memory_report();
 	}
@@ -703,5 +739,9 @@ hv_wdt_pet_init(void)
 	PE_parse_boot_argn("hv_wdt_pet", &hv_wdt_enabled, sizeof(hv_wdt_enabled));
 	hv_wdt_call = thread_call_allocate(hv_wdt_pet, NULL);
 	hv_wdt_pet(NULL, NULL);
+	printf("[HVPET] smc %#x first ret %#llx (%s), fed %llu times at startup\n",
+	    VIRT_WDT_PET, (unsigned long long)hakios_hv_pet_first_ret,
+	    hakios_hv_pet_first_ret == 0 ? "accepted" : "refused",
+	    (unsigned long long)hakios_hv_pet_count);
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, hv_wdt_pet_init);

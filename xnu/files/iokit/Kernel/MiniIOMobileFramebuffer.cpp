@@ -58,6 +58,8 @@ extern "C" vm_offset_t ml_io_map(uint64_t phys_addr, vm_size_t size);   /* osfmk
  */
 static volatile uint32_t *gCtlStart;
 
+static inline void flush_dcache_range(uintptr_t start, size_t len);   /* defined below, in the swap code */
+
 static void
 pushPanel(const char * why)
 {
@@ -71,8 +73,23 @@ pushPanel(const char * why)
 		gCtlStart = (volatile uint32_t *) (mdp + 0x201C);
 		IOLog("MiniIOMobileFramebuffer: MDP CTL_START at %p\n", (void *) gCtlStart);
 	}
+	/*
+	 * fix66: clean the frame into memory before pulling the trigger.  CTL_START tells the MDP's
+	 * DMA engine to fetch the frame from physical RAM; anything still sitting dirty in this CPU's
+	 * caches is a pixel the panel never sees (fix65: the bars were painted, the push was logged,
+	 * the panel stayed blue).  vinfo.v_baseaddr is the kernel VA of the panel's memory -- the
+	 * same pointer fBase is -- so dc civac on it reaches exactly the frame lines.
+	 */
+	if (vinfo.v_baseaddr != 0 && vinfo.v_height != 0 && vinfo.v_rowbytes != 0) {
+		flush_dcache_range((uintptr_t) vinfo.v_baseaddr, (size_t) vinfo.v_height * vinfo.v_rowbytes);
+	}
 	*gCtlStart = 1;
 }
+
+/* fix70: the fix69 thread_call heartbeat is gone -- it lived exactly two beats, because on this
+ * bring-up kernel a thread_call only fires through the idle-poll timer hack and the boot storm
+ * starves its workloop. The liveness beacon moved to hakios_timer_poll
+ * (osfmk/arm64/machine_routines.c), which runs in the very context the question is about. */
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -392,10 +409,10 @@ IOMobileFramebuffer::publishModes(void)
 	setNumber(color, "EOTF", 1);
 	setNumber(color, "DynamicRange", 0);
 	setNumber(color, "Score", 1);
-	const OSSymbol * gamut = OSSymbol::withCString("sRGB");
-	const OSSymbol * sdr   = OSSymbol::withCString("SDR");
-	if (gamut) { color->setObject("Gamut", gamut); gamut->release(); }
-	if (sdr)   { color->setObject("EOTF", sdr); sdr->release(); }
+	/* fix66: the Gamut/"SDR" symbols used to sit here, and the SDR one overwrote "EOTF" with an
+	 * OSSymbol on top of the number 1.  CoreAnimation reads ColorElements' fields as numbers;
+	 * a string there makes it reject the whole colour mode -- "without a mode it draws nothing".
+	 * The number stands, as redwood wrote it. */
 	color->setObject("IsVirtual", kOSBooleanFalse);
 	colors->setObject(color);
 
@@ -508,6 +525,9 @@ IOMobileFramebuffer::start(IOService * provider)
 		hackios_graphics_owned = 1;
 		pushPanel("colour bars");
 	}
+
+	/* fix70: the heartbeat moved out of this driver (see the comment near pushPanel); the beat
+	 * is printed from the idle-poll in machine_routines.c now. */
 
 	fWidth = gFBWidth ? gFBWidth : fPanelWidth;
 	fHeight = gFBHeight ? gFBHeight : fPanelHeight;
@@ -1275,6 +1295,31 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				    (unsigned) s->info.offset, (unsigned) s->info.bytesPerRow, (unsigned) s->info.allocSize);
 			}
 			drawLayer(s, src, dst);
+			/* fix128: swap anındaki yüzeyin boş olup olmadığını kanıtla: kpixels (çekirdek VA)
+			 * üzerinden ilk satırın ortasını ve bir KBLKB'lik parçayı örnekle; aynı anda dst
+			 * (panel belleği) için de ilk satırın ortasını yaz. Farklı hücrelerde sıfır
+			 * yanıtı yüzeyin boş olduğunu (CA hiç çizmemiş), sıfır dışı yanıt drawLayer'ın
+			 * hedefiyle ilgili bir sorunu işaret eder. */
+			/* fix128: swap anındaki yüzeyin boş olup olmadığını kanıtla. */
+			static unsigned fix128_probe = 0;
+			if (report && s->kpixels != NULL && fix128_probe < 8) {
+				uint8_t head[4], mid[4], tail[4];
+				uint32_t nz = 0;
+
+				memcpy(head, s->kpixels, sizeof(head));
+				memcpy(mid, s->kpixels + (size_t) s->info.bytesPerRow * (s->info.height / 2), sizeof(mid));
+				memcpy(tail, s->kpixels + (size_t) s->info.bytesPerRow * (s->info.height - 1), sizeof(tail));
+				for (unsigned i = 0; i < 1024; i++) {
+					if (((const uint8_t *) s->kpixels)[i]) { nz++; }
+				}
+				IOLog("MiniIOMobileFramebuffer: surface probe %u swap %u: head %02x%02x%02x%02x mid %02x%02x%02x%02x tail %02x%02x%02x%02x nz=%u/1k dst %p\n",
+				    fix128_probe, swapWord(swap, SWAP_ID),
+				    head[0], head[1], head[2], head[3],
+				    mid[0], mid[1], mid[2], mid[3],
+				    tail[0], tail[1], tail[2], tail[3],
+				nz, fBase);
+				fix128_probe++;
+			}
 			if (layer == 0) {
 				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
 			}
@@ -1603,7 +1648,12 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 	case 3:  // kFBMethodGetLayerDefaultSurface
 	case 83: // _kern_CopyLayerDisplayedSurface
 		if (args->scalarOutputCount >= 1) {
-			out[0] = fOwner->fLastSurfaceID ? fOwner->fLastSurfaceID : 1;
+			/* fix66: answer with the real default surface, not the number 1: CoreAnimation takes
+			 * this id at face value and swaps it, and an id that names no surface (fLastSurfaceID
+			 * starts at 1, which names whatever surface was made first) strands the swap. */
+			MiniIOSurface * s = fOwner->defaultSurface();
+
+			out[0] = s != NULL ? s->sid : (fOwner->fLastSurfaceID ? fOwner->fLastSurfaceID : 1);
 			args->scalarOutputCount = 1;
 		}
 		return kIOReturnSuccess;
@@ -1722,19 +1772,11 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		}
 		return kIOReturnSuccess;
 
-	case 74: // kFBMethodSupportedFrameInfo (1 scalar in, 1 scalar out, 64 bytes struct out)
-		if (args->scalarOutputCount >= 1) {
-			out[0] = 0;
-			args->scalarOutputCount = 1;
-		}
-		if (args->structureOutput != NULL && args->structureOutputSize >= 64) {
-			bzero(args->structureOutput, args->structureOutputSize);
-			uint32_t * fi = (uint32_t *) args->structureOutput;
-			fi[0] = 1;                  // count = 1 timing mode
-			fi[1] = 60 << 16;           // 60.0 Hz (16.16 fixed point)
-			fi[2] = 16666667;           // frame duration in ns (16.67 ms)
-		}
-		return kIOReturnSuccess;
+	/* fix66: case 74 (kFBMethodSupportedFrameInfo) used to answer with a hand-written 60 Hz
+	 * timing block.  That is redwood's original territory and the invented block may be exactly
+	 * what CoreAnimation chokes on before it ever asks for the mode (block 0x40 of selector 79,
+	 * never seen in a log).  With the case gone the frame falls to the default below: accepted,
+	 * outputs zeroed, and it logs itself -- we will SEE CA ask and get the honest zeros. */
 
 	case 77: // kFBMethodGetCurrentAbsoluteTime
 		if (args->scalarOutputCount >= 1) {
